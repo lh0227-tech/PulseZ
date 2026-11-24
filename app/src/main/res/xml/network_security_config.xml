@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 默认只允许加密连接。明文 http 只放行本机回环与模拟器宿主（localhost / 127.0.0.1 / 10.0.2.2），
+         留给本机调试与模拟器；手机连电脑的局域网明文地址（如 http://192.168.x.x:11434）会被系统拦下。
+         本应用没有「允许明文」的开关：旧字段 Settings.allowCleartext 没有任何消费方，已于 v0.5.1 删除，
+         也不要在设置里恢复这类开关。依据。-->
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

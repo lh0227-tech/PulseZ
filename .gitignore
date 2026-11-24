@@ -1,0 +1,67 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+local.properties
+
+# Android
+*.apk
+*.aab
+*.keystore
+*.jks
+keystore.properties
+captures/
+.cxx/
+.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 工具链与本地产物（不入库）
+tools/
+
+# 本地素材（不属工程产物）
+/*.png
+/*.jpg
+/*.jpeg
+
+
+# Kotlin 会话目录
+.kotlin/
+dist/
+
+
+# 用户放置的测试密钥（项目完成时删除）
+/测试用key项目完成时删除/
+
+# 签名密钥目录与构建测试日志
+keystore/
+*.log
+
+# 本地测试用 DeepSeek 样本包
+samples/
+
+# 仅留本地的文档、过程记录与内部协作规则
+docs/
+res/
+HANDOFF.md
+AGENT.md
+AGENTS.md
+CLAUDE.md
+.agents/
+
+# 官网静态落地页（仅留本地，不入源码库）
+web/
+
+.env
+.env.*
+*.pem
+*.p12
+*.key
+*.pfx

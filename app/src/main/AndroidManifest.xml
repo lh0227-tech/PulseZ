@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        语音输入的麦克风权限（v0.5.1）。
+
+        用途只有一个：把用户按住说话录下的音频转成文字（音频会发给你填的那家 AI 服务商做识别，
+        与「识图会发图给服务商」同一性质）。系统录音 API 必须声明 RECORD_AUDIO 才能用。
+
+        - 这是**运行时权限**：只在用户点语音按钮时才请求，不在启动/进聊天页时索取
+          （用户拒绝不影响打字聊天与其它功能；官方 App 的麦克风说明同此口径）；
+        - 本清单只新增这一条权限，不新增相机/存储/通知等任何其它权限；
+        - 拒绝后仍可在系统设置里重新授予，App 不记录、不上传任何音频到 pulsez 自己的服务器
+          （pulsez 没有服务器，只直连用户自己填的服务商）。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+        自动朗读（系统 TTS）的引擎可见性声明（v0.5）。
+        Android 11+（targetSdk 30+）官方要求：用 TextToSpeech 的 App 必须在 <queries> 里声明
+        TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE，否则可能绑不上系统 TTS 引擎。
+        依据：https://developer.android.com/reference/android/speech/tts/TextToSpeech
+        （原文：「Apps targeting Android 11 that use text-to-speech should declare
+        TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE in the queries elements of their manifest」）
+        注意：这不是权限，不新增任何权限；App 的权限只有「网络」和「麦克风」两个。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".PulsezApp"
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.Pulsez">
+
+        <!--
+            拍照用的 FileProvider（v0.5 识图）。
+            - 只把 cacheDir/camera/ 暴露给系统相机（res/xml/file_paths.xml），不共享附件目录/filesDir；
+            - authority 用 ${applicationId}.fileprovider：debug 变体的 applicationId 带 .debug，
+              与 release 同装不冲突；
+            - **不声明 CAMERA 权限**：用系统相机的 ACTION_IMAGE_CAPTURE/TakePicture 时，
+              manifest 不声明 CAMERA 就不需要运行时权限；一旦声明反而必须申请，且破坏
+              "App 只有网络和麦克风两个权限"的隐私基线。
+            依据：https://developer.android.com/training/secure-file-sharing/setup-sharing
+            -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Pulsez">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 系统分享：从别的 App 把文字分享进来 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!-- 选中文字 → 处理文字 -->
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

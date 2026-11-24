@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 浅色：与官网同源的纯白 -->
+    <color name="pulsez_window_background">#FFFFFFFF</color>
+    <color name="pulsez_ink">#FF0A0A0C</color>
+    <color name="pulsez_signal">#FF5B50F0</color>
+</resources>

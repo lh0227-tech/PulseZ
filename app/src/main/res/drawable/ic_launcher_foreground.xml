@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 脉冲环：三圈同心环 + 中心亮点。不发光、不加渐变。 -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2"
+        android:fillColor="#00000000"
+        android:pathData="M54,34 a20,20 0 1,0 0.01,0" />
+    <path
+        android:strokeColor="#99FFFFFF"
+        android:strokeWidth="1.6"
+        android:fillColor="#00000000"
+        android:pathData="M54,26 a28,28 0 1,0 0.01,0" />
+    <path
+        android:strokeColor="#4DFFFFFF"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000"
+        android:pathData="M54,18 a36,36 0 1,0 0.01,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,49 a5,5 0 1,0 0.01,0" />
+</vector>

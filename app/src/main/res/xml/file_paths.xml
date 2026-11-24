@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    拍照临时目录的 FileProvider 路径（v0.5 识图）。
+
+    只暴露 `cacheDir/camera/`：
+    - `camera/` 是 `CameraCapture.newOutputFile()` 建相机输出文件的地方，拍完立刻压缩进
+      `filesDir/attachments`，原始临时文件处理完就删；
+    - **不要**加 `files-path`（附件私有目录）或根 `cache-path`：FileProvider 一旦暴露，
+      任何拿到 Uri 授权的 App 都能读；只共享"拍照这一件事"用得上的最小目录。
+    依据：https://developer.android.com/training/secure-file-sharing/setup-sharing
+    （官方模板：<paths><cache-path .../></paths>，「The XML file is the only way you can
+    specify the directories」）。
+-->
+<paths>
+    <cache-path
+        name="camera"
+        path="camera/" />
+</paths>
