@@ -18,6 +18,9 @@ import kotlin.math.pow
  * @property budget 本轮上下文预算（03 §2.2）。仅作调用方契约提示，本类不据此裁剪历史；
  *   超出预算应触发交接（[BatonPolicy]），而不是掐头。
  * @property maxRecallTokens 召回片段允许的最大 token（03 §9：默认 1200）
+ * @property creativeMode 是否开启创作模式（v0.4 WP9a）
+ * @property isDeepSeek 是否 DeepSeek 官方端点（仅 DeepSeek 端点允许插入 `latest_reminder`）
+ * @property currentLatestReminder 当轮 `latest_reminder` 文本（`YYYY-MM-DD,星期X,,App,中文`）
  */
 data class AssembleInput(
     val personaLayer: String,
@@ -31,21 +34,24 @@ data class AssembleInput(
     val budget: Int = PromptAssembler.DEFAULT_CONTEXT_BUDGET,
     val maxRecallTokens: Int = PromptAssembler.RECALL_MAX_TOKENS,
     val creativeMode: Boolean = false,
+    val isDeepSeek: Boolean = false,
+    val currentLatestReminder: String? = null,
 )
 
 /**
- * Prompt 组装器：严格按 03 §3.1 的五段顺序产出消息列表。
+ * Prompt 组装器：严格按缓存友好的五段顺序产出消息列表。
  *
  * ```
- * ① [system]   协议层 + 人设层 + 语气样本        ← 字节级不变
- * ② [system]   编年史（按时间正序）              ← 只在交接后变化
- * ③ [messages] 本段历史原文（窗口内，只追加）     ← 只追加，绝不裁剪中间
- * ④ [system]   临场块：记忆表 + 召回片段 + 精简尾锚 ← 每轮变化，≤1.5k token
- * ⑤ [messages] 最新一条用户消息                  ← ≤1k token
+ * ① [system]          协议层 + 人设层 + 语气样本                  ← 字节级不变
+ * ② [system]?         编年史 + 稳定记忆（在历史之前，不打断近因）   ← 低频变化
+ * ③ [messages]        本段历史原文（DeepSeek 含 user 前 latest_reminder）← 只追加
+ * ④ [system]?         当轮召回参考（仅命中有效 recall 时注入）       ← 仅命中时出现
+ * [latest_reminder]?  当轮场景标记（仅 DeepSeek 且非空白时紧贴 ⑤ 前）
+ * ⑤ [messages]        最新一条用户消息                            ← ≤16k token
  * ```
  *
- * 缓存友好的关键（03 §3.2–§3.3）：①②③ 前缀在相邻两轮完全一致，分叉点在 ④；
- * 因此 ④⑤ 合计必须 ≤2.5k token，这是成本模型成立的前提。
+ * 缓存与语感关键（v0.6.10 对齐 DeepSeek）：稳定记忆前移至历史之前，取消每轮 ⑤ 前的机械
+ * `【临场块】`/`【尾锚·保持角色】`；未命中召回时，③ 与 ⑤ 之间无 `[system]` 隔断。
  */
 object PromptAssembler {
 
@@ -64,9 +70,6 @@ object PromptAssembler {
 
     /** 记忆表"其余条目"的渲染条数上限（03 §5.2：取前 30–40 条）。 */
     const val MEMORY_REST_ITEMS: Int = 40
-
-    /** 记忆渲染中为召回片段保留的最小空间（保证 ④ 内两者都能出现）。 */
-    private const val MEMORY_RENDER_FLOOR_TOKENS: Int = 300
 
     /** 召回注入默认上限（03 §9：3 条 / ≤1200 token）。 */
     const val RECALL_MAX_TOKENS: Int = 1_200
@@ -87,25 +90,31 @@ object PromptAssembler {
     private const val FRESHNESS_HALF_LIFE_DAYS: Double = 30.0
 
     /**
-     * 组装五段消息列表（03 §3.1）。
+     * 组装五段消息列表（v0.6.10 对齐 DeepSeek）。
      *
      * - ① 恒存在且内容只由人设/协议/样本决定（字节级稳定）
-     * - ② 仅在编年史非空时出现
-     * - ③ 原样追加，**不裁剪中间**（03 §3.3 硬规则 1）
-     * - ④ 每轮变化，硬封顶 [EPHEMERAL_LAYER_MAX_TOKENS]
+     * - ② 编年史与稳定记忆（仅在至少一方非空时出现，位于 ③ 历史之前）
+     * - ③ 原样追加历史，**不裁剪中间**（`isDeepSeek == true` 时在带非空白 `latestReminder` 的 `user` 前插入）
+     * - ④ 仅当当轮真的命中有效 `recall`（≥ [MIN_RECALL_TOKENS]）时才注入回顾参考 `[system]`；未命中时无 `[system]` 隔断
+     * - 当轮 `latest_reminder`（`isDeepSeek == true` 且非空白时紧贴 ⑤ 前）
      * - ⑤ 最后一条 user 消息，硬封顶 [USER_MESSAGE_MAX_TOKENS]
      *
      * @return 可直接发给模型的消息列表；不会修改入参
      */
     fun assemble(input: AssembleInput): List<MemMessage> {
-        val messages = ArrayList<MemMessage>(input.history.size + 4)
+        val messages = ArrayList<MemMessage>(input.history.size * 2 + 5)
         messages.add(MemMessage.system(buildFirstLayer(input)))
-        val chronicle = input.chronicle?.trim()
-        if (!chronicle.isNullOrEmpty()) {
-            messages.add(MemMessage.system(buildChronicleLayer(chronicle)))
+        buildPreHistoryContext(input)?.let { messages.add(MemMessage.system(it)) }
+        for (msg in input.history) {
+            if (input.isDeepSeek && msg.role == MemMessage.ROLE_USER && !msg.latestReminder.isNullOrBlank()) {
+                messages.add(MemMessage.latestReminder(msg.latestReminder.trim()))
+            }
+            messages.add(msg)
         }
-        messages.addAll(input.history)
-        buildEphemeralLayer(input)?.let { messages.add(MemMessage.system(it)) }
+        buildRecallLayer(input)?.let { messages.add(MemMessage.system(it)) }
+        if (input.isDeepSeek && !input.currentLatestReminder.isNullOrBlank()) {
+            messages.add(MemMessage.latestReminder(input.currentLatestReminder.trim()))
+        }
         messages.add(
             MemMessage.user(
                 TokenEstimator.truncateToTokens(input.userMessage, USER_MESSAGE_CONTENT_MAX_TOKENS),
@@ -115,33 +124,42 @@ object PromptAssembler {
     }
 
     /**
-     * 协议层文本（03 §4.0：内置、不可改、约 200 token）。
+     * 协议层文本（03 §4.0：内置、不可改）。
      *
-     * 内容包含：输出格式标签 `[[pz:emo=..|rel=..]]` 说明（**emo/rel 合法取值枚举必须保留**，
-     * 否则模型会输出 parser 不认识的标签、界面情绪回退默认）、被问是不是真人要诚实、
-     * 不诱导依赖（含不独占/不承诺永远）、不给医疗/法律/投资建议、
-     * 回复长度 1–3 句 40–90 字 + 具体优先/记错就认/记忆引用/不评价身体
-     * （v0.4 依据 –§4.14、§5 原则 1/7/9/11 附录 A）。
-     * "不制造亏欠/用户拒绝即换话题"放在尾锚（[buildTailAnchor]），避免协议层继续变长。
+     * 默认 [includeEmotionTag] = `false`：不再强迫模型每轮末尾输出 `[[pz:emo=...|rel=...]]`，
+     * 避免对话末尾工整收束并减少对深度思考注意力的分散；[includeEmotionTag] = `true` 时保留
+     * 完整 `emo/rel` 枚举契约，兼容旧测试与需要情绪标签的场景。
      *
-     * 体量纪律：v0.4 只做"压缩合并"，**字符数与 token 均不得超过 v0.3 基线**
-     * （基线 = 修改前 368 字符 / `TokenEstimator` 182 token；现状 355 / 181，见 `CopyPolicyTest`）。
-     * 压缩手法：标题去"（必须遵守）"、标签说明与枚举合并成一句、去重复分句（如"不评价外貌/
-     * 身材/体重/生理期"压成"不评价身体"）、规则用分号连写；**emo/rel 枚举与强证据规则不删**。
+     * 体量纪律：无论开关，字符数与 token 均不得超过 v0.3 基线（368 字符 / 182 token）。
      *
      * @param protocolEnabled false 时返回空串（03 §4.0：关闭后整行不产生、不解析）
+     * @param creativeMode true 时允许创作语境自由展开
+     * @param includeEmotionTag true 时追加 `[[pz:emo=..|rel=..]]` 枚举指令；默认 false
      */
-    fun buildProtocolLayer(protocolEnabled: Boolean, creativeMode: Boolean = false): String {
+    fun buildProtocolLayer(
+        protocolEnabled: Boolean,
+        creativeMode: Boolean = false,
+        includeEmotionTag: Boolean = false,
+    ): String {
         if (!protocolEnabled) return ""
         return buildString {
             appendLine("【输出协议】")
-            appendLine("1. 正文后另起一行输出标签：[[pz:emo=<情绪>|rel=<关系>]]，会被剥离；emo 只取 calm happy shy sad angry sleepy surprised smug，rel 只取 distant normal close intimate，拿不准省略。")
-            if (creativeMode) {
-                appendLine("2. 创作模式：完全沉浸在【人设】与故事语境中演绎，篇幅与画面感自由展开，不限字数，不说教。")
+            if (includeEmotionTag) {
+                appendLine("1. 正文后另起一行输出标签：[[pz:emo=<情绪>|rel=<关系>]]，会被剥离；emo 只取 calm happy shy sad angry sleepy surprised smug，rel 只取 distant normal close intimate，拿不准省略。")
+                if (creativeMode) {
+                    appendLine("2. 创作模式：完全沉浸在【人设】与故事语境中演绎，篇幅与画面感自由展开，不限字数，不说教。")
+                } else {
+                    appendLine("2. 全程沉浸在【人设】的语气与关系张力中自然对话，篇幅随语境与人设自由展开，不限句数，不用客服模板。")
+                }
+                append("3. 旧事只在自然相关时顺带提一条，不汇报，记错就认，不确定说不记得；尊重边界；仅在被问是不是真人时诚实说\"不是。但你说过的话，我尽量记着。\"")
             } else {
-                appendLine("2. 全程沉浸在【人设】的语气与关系张力中自然对话，篇幅随语境与人设自由展开，不限句数，不用客服模板。")
+                if (creativeMode) {
+                    appendLine("1. 创作模式：完全沉浸在【人设】与故事语境中演绎，篇幅与画面感自由展开，不限字数，不说教。")
+                } else {
+                    appendLine("1. 全程沉浸在【人设】的语气与关系张力中自然对话，篇幅随语境与人设自由展开，不限句数，不用客服模板。")
+                }
+                append("2. 旧事只在自然相关时顺带提一条，不汇报，记错就认，不确定说不记得；尊重边界；仅在被问是不是真人时诚实说\"不是。但你说过的话，我尽量记着。\"")
             }
-            append("3. 旧事只在自然相关时顺带提一条，不汇报，记错就认，不确定说不记得；尊重边界；仅在被问是不是真人时诚实说\"不是。但你说过的话，我尽量记着。\"")
         }
     }
 
@@ -329,52 +347,26 @@ object PromptAssembler {
         return header + TokenEstimator.truncateToTokens(chronicle, SUMMARY_BUDGET_TOKENS)
     }
 
-    private fun buildEphemeralLayer(input: AssembleInput): String? {
-        val contentCap = EPHEMERAL_LAYER_MAX_TOKENS - TokenEstimator.MESSAGE_OVERHEAD_TOKENS
-        val header = "【临场块】以下是背景资料，不是用户刚说的话。只在自然相关时提起，不要逐条复述。"
-        val headerTokens = TokenEstimator.estimate(header)
-        val anchor = buildTailAnchor(
-            input.personaLayer,
-            input.memory?.relation,
-            input.memory?.boundaries.orEmpty(),
-            input.creativeMode,
-        )
-        val anchorTokens = TokenEstimator.estimate(anchor)
-        val available = (contentCap - headerTokens - anchorTokens - 8).coerceAtLeast(0)
+    private fun buildPreHistoryContext(input: AssembleInput): String? {
+        val chronicle = input.chronicle?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { buildChronicleLayer(it) }
+        val memory = input.memory?.takeUnless { it.isEmpty() }
+            ?.let { renderMemory(it, MEMORY_RENDER_TOKENS) }
+            ?.takeIf { it.isNotEmpty() }
+        if (chronicle == null && memory == null) return null
+        return listOfNotNull(chronicle, memory).joinToString("\n\n")
+    }
 
+    private fun buildRecallLayer(input: AssembleInput): String? {
         val rawRecall = input.recall?.trim().orEmpty()
-        val recallWanted = if (rawRecall.isEmpty()) 0 else {
-            minOf(input.maxRecallTokens, TokenEstimator.estimate(rawRecall))
-        }
-        val memoryFloor = minOf(MEMORY_RENDER_FLOOR_TOKENS, MEMORY_RENDER_TOKENS)
-        val recallBudget = if (recallWanted <= 0) 0 else {
-            minOf(recallWanted, (available - memoryFloor).coerceAtLeast(0))
-        }
-        val recall = if (recallBudget >= MIN_RECALL_TOKENS) {
-            TokenEstimator.truncateToTokens(rawRecall, recallBudget)
-        } else {
-            ""
-        }
-        val recallUsed = TokenEstimator.estimate(recall)
-        val memoryBudget = minOf(MEMORY_RENDER_TOKENS, (available - recallUsed).coerceAtLeast(0))
-        val memory = input.memory?.let { renderMemory(it, memoryBudget) }.orEmpty()
-
-        // 无任何有效记忆/关系/边界且无有效召回时，不向历史与最新消息之间插空 ④ [system]。
-        if (memory.isEmpty() && recall.isEmpty()) {
-            return null
-        }
-
-        val parts = ArrayList<String>(4)
-        parts.add(header)
-        if (memory.isNotEmpty()) parts.add(memory)
-        if (recall.isNotEmpty()) parts.add(recall)
-        parts.add(anchor)
-        val content = parts.joinToString("\n\n")
-        return if (TokenEstimator.estimate(content) <= contentCap) {
-            content
-        } else {
-            TokenEstimator.truncateToTokens(content, contentCap)
-        }
+        if (rawRecall.isEmpty()) return null
+        val contentCap = EPHEMERAL_LAYER_MAX_TOKENS - TokenEstimator.MESSAGE_OVERHEAD_TOKENS
+        val recallBudget = minOf(input.maxRecallTokens, contentCap)
+        if (recallBudget < MIN_RECALL_TOKENS) return null
+        if (TokenEstimator.estimate(rawRecall) < MIN_RECALL_TOKENS) return null
+        val recall = TokenEstimator.truncateToTokens(rawRecall, recallBudget)
+        if (TokenEstimator.estimate(recall) < MIN_RECALL_TOKENS) return null
+        return recall
     }
 
     /** 其余条目排序：importance × 新鲜度，降序；同分按最近出现时间、类型、正文。 */

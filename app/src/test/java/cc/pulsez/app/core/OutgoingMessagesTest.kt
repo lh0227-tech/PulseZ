@@ -271,6 +271,82 @@ class OutgoingMessagesTest {
         assertEquals("在吗", last["content"]!!.jsonPrimitive.content)
     }
 
+    @Test
+    fun `sourceId 挂载在插入 latest_reminder 后依然精准匹配图片与文件并透传思考工具`() {
+        val assembled = listOf(
+            MemMessage.system("人设"),
+            MemMessage.latestReminder("2026-11-24,星期二,,App,中文"),
+            MemMessage.user("看这个 PDF 和图", sourceId = "u-1"),
+            MemMessage(
+                role = MemMessage.ROLE_ASSISTANT,
+                content = "我看完了",
+                sourceId = "a-1",
+                reasoningContent = "先读附件再检索",
+                serverToolCallsJson = """[{"id":"tc1"}]""",
+            ),
+            MemMessage.latestReminder("2026-11-25,星期三,,App,中文"),
+            MemMessage.user("再看今天这份文件"),
+        )
+
+        val messages = ChatEngine.buildOutgoingMessages(
+            assembled = assembled,
+            recentImageMessageId = "u-1",
+            currentImages = emptyList(),
+            recentImages = listOf(ContentPart.Image("HIST_IMG")),
+            currentFiles = listOf(ContentPart.File("file-cur", "today.pdf")),
+            filePartsByMessageId = mapOf(
+                "u-1" to listOf(ContentPart.File("file-hist", "note.txt")),
+            ),
+        )
+
+        assertEquals(6, messages.size)
+        // latest_reminder 与 system 均不带 parts、不带思考字段
+        assertTrue(messages[1].parts.isEmpty())
+        assertEquals("latest_reminder", messages[1].role)
+        assertEquals(null, messages[1].reasoningContent)
+
+        // 历史 u-1 虽然前面插入了 latest_reminder 导致下标偏移，按 sourceId 依然精准挂载正文 + 文件 + 图片
+        assertEquals(
+            listOf(
+                ContentPart.Text("看这个 PDF 和图"),
+                ContentPart.File("file-hist", "note.txt"),
+                ContentPart.Image("HIST_IMG"),
+            ),
+            messages[2].parts,
+        )
+
+        // 历史 assistant 透传 reasoningContent 与 serverToolCallsJson，且绝不带 parts
+        assertTrue(messages[3].parts.isEmpty())
+        assertEquals("先读附件再检索", messages[3].reasoningContent)
+        assertEquals("""[{"id":"tc1"}]""", messages[3].serverToolCallsJson)
+
+        // 当轮 ⑤ user 挂载 currentFiles
+        assertEquals(
+            listOf(
+                ContentPart.Text("再看今天这份文件"),
+                ContentPart.File("file-cur", "today.pdf"),
+            ),
+            messages.last().parts,
+        )
+    }
+
+    @Test
+    fun `纯文件当轮只有 File part 不产生空 Text part`() {
+        val assembled = listOf(
+            MemMessage.system("人设"),
+            MemMessage.user(""),
+        )
+        val messages = ChatEngine.buildOutgoingMessages(
+            assembled = assembled,
+            recentImageMessageId = null,
+            currentImages = emptyList(),
+            recentImages = emptyList(),
+            currentFiles = listOf(ContentPart.File("file-1", "report.docx")),
+            filePartsByMessageId = emptyMap(),
+        )
+        assertEquals(listOf(ContentPart.File("file-1", "report.docx")), messages.last().parts)
+    }
+
     // ------------------------------------------------------------ 辅助
 
     private fun payloadOf(messages: List<ChatMessage>): JsonObject {

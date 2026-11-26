@@ -254,7 +254,7 @@ class GroupReplyCall(
      * 发起一次群聊生成并记账。
      *
      * @return 模型原始输出（未剥协议标签）+ 记账使用的 usage
-     * @throws ApiException 流以 [LlmEvent.Failed] 结束（失败前已吐字会先记账）
+     * @throws ApiException 流以 [LlmEvent.Failed] 结束；失败前的前缀只用于估算已产生的用量，绝不作为 [Output] 返回
      * @throws kotlinx.coroutines.CancellationException 用户取消（取消前已按估算记账）
      */
     suspend fun invoke(messages: List<MemMessage>, maxTokens: Int): Output {
@@ -285,6 +285,7 @@ class GroupReplyCall(
                         is LlmEvent.Reasoning -> {
                             sawAnyProgress = true
                         }
+                        is LlmEvent.ToolProgress -> Unit
                         is LlmEvent.Finished -> {
                             sawAnyProgress = true
                             usage = event.usage

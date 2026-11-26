@@ -86,6 +86,30 @@ class WebSearchFallbackTest {
         assertTrue("正常请求仍带 tools", "tools" in bodyOf(server.takeRequest()))
     }
 
+    @Test
+    fun `400 when readUrl enabled drops both webSearch and readUrl and retries once`() {
+        server.enqueue(
+            MockResponse().setResponseCode(400).setBody(
+                """{"error":{"message":"unknown tool deepseek_read_url"}}""",
+            ),
+        )
+        server.enqueue(sseResponse())
+
+        val events = runBlocking {
+            client().stream(
+                request(webSearch = false).copy(readUrl = true),
+            ).toList()
+        }
+        val finished = events.last() as LlmEvent.Finished
+
+        assertTrue(finished.webSearchDropped)
+        assertEquals(2, server.requestCount)
+        val first = bodyOf(server.takeRequest())
+        val second = bodyOf(server.takeRequest())
+        assertTrue("第一次请求应带 tools", "tools" in first)
+        assertFalse("降级后不得再带 tools", "tools" in second)
+    }
+
     // ------------------------------------------------------------------ 不降级的情况
 
     @Test

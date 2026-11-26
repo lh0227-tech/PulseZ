@@ -3,6 +3,7 @@ package cc.pulsez.app.core
 import android.util.Base64
 import cc.pulsez.app.AppContainer
 import cc.pulsez.app.data.attachments.AttachmentStore
+import cc.pulsez.app.data.db.AttachmentEntity
 import cc.pulsez.app.data.db.AttachmentKind
 import cc.pulsez.app.data.db.AttachmentStatus
 import cc.pulsez.app.data.db.ChunkEntity
@@ -11,6 +12,7 @@ import cc.pulsez.app.data.db.SegmentEntity
 import cc.pulsez.app.data.db.ThreadEntity
 import cc.pulsez.app.data.repo.UsageCategory
 import cc.pulsez.app.data.settings.Settings
+import cc.pulsez.app.data.settings.isDeepSeekProvider
 import cc.pulsez.app.mem.AssembleInput
 import cc.pulsez.app.mem.BatonPolicy
 import cc.pulsez.app.mem.BigramIndex
@@ -88,6 +90,8 @@ class ChatEngine(private val container: AppContainer) {
          * 删掉前先确认没有外部调用点，别在 顺手当死代码清掉。
          */
         val imageTokens: Int = 0,
+        /** 本轮生成或复用的 DeepSeek `latest_reminder` 文本（非 DeepSeek 端点为 null）。 */
+        val latestReminder: String? = null,
     )
 
     // ---------------------------------------------------------------- 组装
@@ -113,16 +117,32 @@ class ChatEngine(private val container: AppContainer) {
      * @param characterId 当前角色（① 段人设层、语气样本；已删除时为 null）
      * @param userText 本轮用户消息，会作为 ⑤ 段追加在最后
      * @param excludeMessageId 要从本段历史里剔除的消息 id，即**本轮刚落库的用户消息 id**。
+     * @param additionalExcludedMessageIds 同轮需要从历史剔除的其他行，例如待重新生成的旧助手回复。
      *   默认 null = 不过滤，保持旧调用点/既有测试的兼容；真正的发送链路必须传，
      *   否则本轮的重复不会消失。
+     * @param reuseLatestReminder 重试/重新生成时传入原用户消息已落库的 `latestReminder` 以保缓存与日期一致；
+     *   非空白时直接复用，否则 DeepSeek 端点按当前时刻生成。
      */
     suspend fun prepare(
         thread: ThreadEntity,
         characterId: String,
         userText: String,
         excludeMessageId: String? = null,
+        reuseLatestReminder: String? = null,
+        additionalExcludedMessageIds: Set<String> = emptySet(),
+        /** Settings snapshot paired with the request's already-resolved endpoint/client. */
+        requestSettings: Settings? = null,
+        /** Binding ID from that same request session; null is unverifiable and fails closed. */
+        remoteCredentialBindingId: String? = null,
     ): Prepared {
-        val settings = container.settings.flow.first()
+        val settings = requestSettings ?: container.settings.flow.first()
+        val isDeepSeek = settings.isDeepSeekProvider()
+        val latestReminder = if (isDeepSeek) {
+            reuseLatestReminder?.takeIf { it.isNotBlank() }?.trim()
+                ?: LatestReminder.format(System.currentTimeMillis())
+        } else {
+            null
+        }
         val character = container.characters.get(characterId)
         val memory = container.memory.load(thread.id)
         val segments = container.database.segmentDao().forThread(thread.id)
@@ -136,11 +156,12 @@ class ChatEngine(private val container: AppContainer) {
         }.orEmpty()
         // 剔除本轮刚落库的用户消息：它在库里、也在 ⑤ 段，
         // 不剔除就会在模型侧重复一次。过滤后再转 MemMessage，③ 段与召回都只看真正的历史。
-        val openRows = historyRowsForPrompt(historyRows, excludeMessageId)
-        val importTailRows = if (openRows.size < IMPORT_TAIL_MAX_MESSAGES) {
-            val latestImportSegment = findLatestImportSegmentBeforeOpen(segments, thread.activeSegmentId)
-            if (latestImportSegment != null) {
-                val segmentRows = container.database.messageDao().bySegment(latestImportSegment.id)
+        val openRows = historyRowsForPrompt(historyRows, excludeMessageId, additionalExcludedMessageIds)
+        val continuityTailRows = if (openRows.size < IMPORT_TAIL_MAX_MESSAGES) {
+            val latestContinuitySegment = findLatestContinuitySegmentBeforeOpen(segments, thread.activeSegmentId)
+            if (latestContinuitySegment != null) {
+                val segmentRows = container.database.messageDao().bySegment(latestContinuitySegment.id)
+                    .filterNot { it.id in additionalExcludedMessageIds }
                 takeImportTailRows(
                     importRows = segmentRows,
                     maxMessages = IMPORT_TAIL_MAX_MESSAGES - openRows.size,
@@ -152,17 +173,48 @@ class ChatEngine(private val container: AppContainer) {
         } else {
             emptyList()
         }
-        val rowsForPrompt = importTailRows + openRows
+        val rowsForPrompt = continuityTailRows + openRows
 
-        // ---- v0.5.0 识图：历史图片策略----
+        // ---- v0.5.0 识图 + v0.6.10 文件：读取活附件并按 sourceId 挂载 ----
         // 「当轮 + 最近 1 个带图用户轮」带图块；更早的图片消息在 prompt 里留「[图片]」占位
-        // （不读 base64，省 token/费用）。UI 侧仍显示本地缩略图（不走这里）。
-        val imageCounts = imageCountsByMessage()
+        // （不读 base64，省 token/费用）。仅 DeepSeek 端点允许附带 DeepSeek 私有 ContentPart.File；
+        // 切到第三方端点时历史纯文件消息回退成可读文本占位，不向第三方发 file_id。
+        val liveAttachments = liveAttachmentsSafe()
+        val imageCounts = imageCountsByMessage(liveAttachments)
+        val fileMessageIds = fileMessageIds(liveAttachments)
+        val unavailableFileMessageIds = unavailableFileMessageIds(
+            attachments = liveAttachments,
+            isDeepSeek = isDeepSeek,
+            requestCredentialBindingId = remoteCredentialBindingId,
+        )
+        val filePartsByMessageId = buildFilePartsByMessageId(
+            attachments = liveAttachments,
+            isDeepSeek = isDeepSeek,
+            requestCredentialBindingId = remoteCredentialBindingId,
+        )
         val recentImageMessageId = recentImageUserMessageId(rowsForPrompt, imageCounts)
         val history = rowsForPrompt.map { row ->
             val hasImages = (imageCounts[row.id] ?: 0) > 0
             val keepImageBlock = row.id == recentImageMessageId
-            row.toMem(promptContentForMessage(row.content, hasImage = hasImages, keepImageBlock = keepImageBlock))
+            val imageAdjusted = promptContentForMessage(
+                row.content,
+                hasImage = hasImages,
+                keepImageBlock = keepImageBlock,
+            )
+            val contentForPrompt = when {
+                isDeepSeek && row.id in unavailableFileMessageIds ->
+                    if (filePartsByMessageId[row.id].isNullOrEmpty()) {
+                        unavailableFileHistoryContent(imageAdjusted)
+                    } else {
+                        partiallyUnavailableFileHistoryContent(imageAdjusted)
+                    }
+                row.id in fileMessageIds && imageAdjusted.isBlank() -> FILE_PLACEHOLDER
+                else -> imageAdjusted
+            }
+            row.toMem(
+                contentOverride = contentForPrompt,
+                includeDeepSeekMeta = isDeepSeek,
+            )
         }
 
         val recallText = recallText(thread.id, history, userText)
@@ -193,31 +245,31 @@ class ChatEngine(private val container: AppContainer) {
                 userMessage = userText,
                 budget = budget,
                 creativeMode = settings.creativeMode,
+                isDeepSeek = isDeepSeek,
+                currentLatestReminder = latestReminder,
             ),
         )
 
-        // 图片 content parts：⑤ 段（当轮，已由调用方绑定到 excludeMessageId 的消息上）与
-        // ③ 段里最近那个带图用户轮。更早的图片消息只有「[图片]」占位，不再读文件。
-        // 注意：assistant 消息永远不带 parts（官方限制：assistant 放图会 400）。
-
-        // **正文不能丢（阻断 修复，`）**：官方请求形态是
-        // `content: [{"type":"text","text":用户问题},{"type":"image_url",...}]`
-        // 。抽到 [buildOutgoingMessages] 里
-        // 把正文作为**首个** text 块放在图片前；纯图消息（正文是 [IMAGE_PLACEHOLDER]）只发图块。
+        // 图片与文件 content parts：按 sourceId 与 assembled.lastIndex 精确挂载（彻底脱离下标算术猜测）。
+        // 注意：assistant / system / latest_reminder 永远不带 parts。
         val currentImages = loadImageParts(excludeMessageId)
         val recentImages = if (recentImageMessageId != null && recentImageMessageId != excludeMessageId) {
             loadImageParts(recentImageMessageId)
         } else {
             emptyList()
         }
-        val recentHistoryIndex = rowsForPrompt.indexOfFirst { it.id == recentImageMessageId }
-        val historyStart = historyStartIndex(assembled, history.size)
+        val currentFiles = if (isDeepSeek) {
+            excludeMessageId?.let { filePartsByMessageId[it] }.orEmpty()
+        } else {
+            emptyList()
+        }
         val messages = buildOutgoingMessages(
             assembled = assembled,
-            historyStart = historyStart,
-            recentImageHistoryIndex = recentHistoryIndex,
+            recentImageMessageId = recentImageMessageId,
             currentImages = currentImages,
             recentImages = recentImages,
+            currentFiles = currentFiles,
+            filePartsByMessageId = filePartsByMessageId,
         )
         val imageCount = currentImages.size + recentImages.size
 
@@ -228,19 +280,21 @@ class ChatEngine(private val container: AppContainer) {
             memoryCount = container.memory.activeCount(thread.id),
             imageCount = imageCount,
             imageTokens = TokenEstimator.estimateImages(imageCount),
+            latestReminder = latestReminder,
         )
     }
 
     // ---------------------------------------------------------------- 识图（v0.5.0）
 
+    private suspend fun liveAttachmentsSafe(): List<AttachmentEntity> = runCatching {
+        container.database.attachmentDao().allLive()
+    }.getOrDefault(emptyList())
+
     /**
      * 每条消息带了几张图（v0.5.0 识图；只算活附件、排除失败态）。
-     *
-     * 一次 `allLive()` 查完再在内存里分组，避免"每行都用 `byMessageId` 查一次"
-     * （历史可能有几十条用户消息）。附件数量级是"用户发过的图片数"，不是消息数，扫描成本可控。
      */
-    private suspend fun imageCountsByMessage(): Map<String, Int> = runCatching {
-        container.database.attachmentDao().allLive()
+    private fun imageCountsByMessage(attachments: List<AttachmentEntity>): Map<String, Int> =
+        attachments
             .filter {
                 it.kind == AttachmentKind.IMAGE &&
                     !it.messageId.isNullOrBlank() &&
@@ -248,7 +302,6 @@ class ChatEngine(private val container: AppContainer) {
             }
             .groupingBy { it.messageId!! }
             .eachCount()
-    }.getOrDefault(emptyMap())
 
     /**
      * 读一条消息的本地图片文件 → `ContentPart.Image`（base64 JPEG）。
@@ -590,7 +643,7 @@ class ChatEngine(private val container: AppContainer) {
         if (!BatonPolicy.shouldBaton(segmentTokens, budget)) return
 
         val shards = BatonPolicy.shard(rows.map { it.toMem() }, shardTokens = 40_000, overlap = 2)
-        val summaryParts = mutableListOf<String>()
+        val fallbackParts = mutableListOf<String>()
 
         for ((index, shard) in shards.withIndex()) {
             val json = client.completeJson(
@@ -610,8 +663,18 @@ class ChatEngine(private val container: AppContainer) {
             // v0.5.4 每片摘要返回后都先比对代际；清空过就不再继续写记忆/封段。
             if (wipeChangedSince(wipeEpoch)) return
             container.memory.applyPatch(thread.id, json, segmentId)
-            summaryParts += "第 ${index + 1} 段：" + shard.takeLast(6).joinToString("；") { it.content.take(40) }
+            fallbackParts += fallbackSummaryPart(index, shard)
         }
+
+        val generatedSummary = summarizeBaton(
+            client = client,
+            model = settings.chatModel,
+            baseUrl = settings.chatBaseUrl,
+            rows = rows,
+        )
+        // v0.5.4 F02：剧情梗概请求期间可能已清空，命中就放弃封段写库。
+        if (wipeChangedSince(wipeEpoch)) return
+        val summary = resolveBatonSummary(generatedSummary, fallbackParts)
 
         // 封段/建段前再校验一次，且**以最新段为准**：`SegmentDao.latest()` 是
         // `ORDER BY ordinal DESC LIMIT 1`（即 max(ordinal)，` 第 1 条）。
@@ -627,7 +690,8 @@ class ChatEngine(private val container: AppContainer) {
         container.database.segmentDao().upsert(
             latest.copy(
                 state = "SEALED",
-                summary = summaryParts.joinToString("\n").take(1500),
+                summary = summary,
+                batonReason = latest.batonReason ?: BUDGET_REASON,
                 lastMessageAt = rows.lastOrNull()?.createdAt ?: latest.lastMessageAt,
             ),
         )
@@ -646,24 +710,37 @@ class ChatEngine(private val container: AppContainer) {
             lastMessageAt = now,
             tokenSum = 0,
             state = "OPEN",
-            batonReason = "BUDGET",
+            batonReason = BUDGET_REASON,
             createdAt = now,
         )
         container.database.segmentDao().upsert(newSegment)
         container.database.threadDao().setActiveSegment(freshThread.id, newSegment.id, newSegment.ordinal)
     }
 
-    private fun MessageEntity.toMem(): MemMessage = MemMessage(
-        role = role,
-        content = content,
-        createdAt = createdAt,
-    )
+    private suspend fun summarizeBaton(
+        client: cc.pulsez.app.net.LlmClient,
+        model: String,
+        baseUrl: String,
+        rows: List<MessageEntity>,
+    ): String? = runCatching {
+        client.complete(buildBatonSummaryRequest(model, rows, baseUrl))
+    }.getOrNull()
 
-    /** 用指定正文转 prompt 行（v0.5.0 识图：历史图片行换成「[图片]」占位）。*/
-    private fun MessageEntity.toMem(contentOverride: String): MemMessage = MemMessage(
+    /**
+     * 持久层消息行 → [MemMessage]；保留 [sourceId] 供精准挂载附件，并仅在 DeepSeek 端点携带
+     * `reasoningContent` / `serverToolCallsJson` / `latestReminder`。
+     */
+    private fun MessageEntity.toMem(
+        contentOverride: String = content,
+        includeDeepSeekMeta: Boolean = false,
+    ): MemMessage = MemMessage(
         role = role,
         content = contentOverride,
         createdAt = createdAt,
+        sourceId = id,
+        reasoningContent = if (includeDeepSeekMeta) reasoningContent else null,
+        serverToolCallsJson = if (includeDeepSeekMeta) serverToolCallsJson else null,
+        latestReminder = if (includeDeepSeekMeta) latestReminder else null,
     )
 
     companion object {
@@ -675,15 +752,20 @@ class ChatEngine(private val container: AppContainer) {
          * 。`prepare` 只拿它判断"要不要补一句接着聊"，不驱动别的逻辑。
          */
         const val IMPORT_REASON: String = "IMPORT"
+
+        /** `segment.batonReason` 取值：原生预算满触发交接。 */
+        const val BUDGET_REASON: String = "BUDGET"
         internal const val IMPORT_TAIL_MAX_MESSAGES: Int = 30
         internal const val IMPORT_TAIL_MAX_CHARS: Int = 12_000
+        internal const val BATON_SUMMARY_MAX_CHARS: Int = 1_500
+        internal const val BATON_TRANSCRIPT_MAX_CHARS: Int = 24_000
 
         /**
          * 找出当前 `OPEN` 段之前按 `ordinal` 排列的最后一个 `SEALED` 段；
-         * 仅当该段 `batonReason == IMPORT_REASON`（即刚导入或导入后刚开聊、尚未发生过正常封存）
-         * 时返回它，用于衔接最近导入原文进 ③ history。
+         * 当该段属于导入（[IMPORT_REASON]）或原生预算交接（[BUDGET_REASON]）时返回它，
+         * 让新开 `OPEN` 段自然衔接上一段尾部最近对话原文，避免封段瞬间失忆。
          */
-        internal fun findLatestImportSegmentBeforeOpen(
+        internal fun findLatestContinuitySegmentBeforeOpen(
             segments: List<SegmentEntity>,
             activeSegmentId: String?,
         ): SegmentEntity? {
@@ -695,7 +777,11 @@ class ChatEngine(private val container: AppContainer) {
                 .filter { it.ordinal < openSegment.ordinal && it.state == "SEALED" }
                 .maxByOrNull { it.ordinal }
                 ?: return null
-            return latestSealedBeforeOpen.takeIf { it.batonReason == IMPORT_REASON }
+            return latestSealedBeforeOpen.takeIf {
+                it.batonReason == IMPORT_REASON ||
+                    it.batonReason == BUDGET_REASON ||
+                    openSegment.batonReason == BUDGET_REASON
+            }
         }
 
         /**
@@ -757,11 +843,40 @@ class ChatEngine(private val container: AppContainer) {
         internal fun historyRowsForPrompt(
             rows: List<MessageEntity>,
             excludeMessageId: String?,
-        ): List<MessageEntity> =
-            if (excludeMessageId == null) rows else rows.filterNot { it.id == excludeMessageId }
+            additionalExcludedMessageIds: Set<String> = emptySet(),
+        ): List<MessageEntity> = when {
+            excludeMessageId == null && additionalExcludedMessageIds.isEmpty() -> rows
+            else -> rows.filterNot {
+                it.id == excludeMessageId || it.id in additionalExcludedMessageIds
+            }
+        }
 
         /** 纯图消息落库正文用的占位（导出/降级/无附件时仍有可读正文）。*/
         const val IMAGE_PLACEHOLDER: String = "[图片]"
+
+        /** 历史纯文件消息在切到非 DeepSeek 端点时回退的可读占位。 */
+        const val FILE_PLACEHOLDER: String = "[文件]"
+
+        /** DeepSeek 历史文件绑定不匹配时，明确告知模型本轮没有附带该文件内容。 */
+        const val FILE_UNAVAILABLE_PLACEHOLDER: String = "[文件不可用：本轮未附带文件内容]"
+        /** DeepSeek 历史同一条消息仍有其它同绑定文件可读时使用。 */
+        const val FILE_PARTIALLY_UNAVAILABLE_PLACEHOLDER: String = "[部分文件不可用：有文件内容未随本轮发送]"
+
+        /** Preserve any historical body while making a suppressed file reference explicit. */
+        internal fun unavailableFileHistoryContent(content: String): String =
+            if (content.isBlank() || content.trim() == FILE_PLACEHOLDER) {
+                FILE_UNAVAILABLE_PLACEHOLDER
+            } else {
+                "$content\n$FILE_UNAVAILABLE_PLACEHOLDER"
+            }
+
+        /** Preserve text and any authorized file parts while identifying omitted sibling files. */
+        internal fun partiallyUnavailableFileHistoryContent(content: String): String =
+            if (content.isBlank() || content.trim() == FILE_PLACEHOLDER) {
+                FILE_PARTIALLY_UNAVAILABLE_PLACEHOLDER
+            } else {
+                "$content\n$FILE_PARTIALLY_UNAVAILABLE_PLACEHOLDER"
+            }
 
         /**
          * 历史里"最近 1 个带图的用户轮"（v0.5.0 识图；`）。
@@ -827,37 +942,140 @@ class ChatEngine(private val container: AppContainer) {
             hasEphemeral: Boolean = true,
         ): Int = assembledSize - historySize - if (hasEphemeral) 2 else 1
 
+        private fun fileMessageIds(attachments: List<AttachmentEntity>): Set<String> {
+            if (attachments.isEmpty()) return emptySet()
+            val ids = HashSet<String>()
+            for (attachment in attachments) {
+                if (attachment.kind != AttachmentKind.FILE) continue
+                if (attachment.status == AttachmentStatus.FAILED) continue
+                val messageId = attachment.messageId?.takeIf { it.isNotBlank() } ?: continue
+                ids.add(messageId)
+            }
+            return ids
+        }
+
         /**
-         * 组装结果 → 可发送的 [ChatMessage] 列表（v0.5.0 识图；**阻断 的修复点**）。
+         * File IDs are credential-scoped. Only return them for a DeepSeek request when the binding
+         * persisted with the attachment exactly matches the already-resolved request session.
+         * Unknown bindings on either side fail closed; no endpoint/key is resolved here.
          *
-         * 为什么放在 ChatEngine 层、而不是 `Payloads` 的 parts 非空分支：
-         * 1. **层次**：`net` 层只负责序列化，不应该知道 prompt 层的「[图片]」占位口径与
-         *    「当前轮 / 最近 1 轮」策略；反过来 `core` 本来就持有这些知识（[IMAGE_PLACEHOLDER]、
-         *    [promptContentForMessage]、[historyStartIndex]），在这里决定 parts 内容最自然。
-         * 2. **可测**：本函数是纯函数，`OutgoingMessagesTest` 可以直接从"五段组装结果"出发断言
-         *    请求形态（` ①：`prepare` 里的这部分此前删掉也全绿）。
-         * 3. **隐私/正确性**：纯图消息的正文是占位 [IMAGE_PLACEHOLDER]（落库/导出用），
-         *    这里明确**不把它当文字发给模型**，只发图块；`Payloads` 不需要重复这条规则。
+         * The binding comes from `AppContainer.ChatEndpointSession.remoteCredentialBindingId` and
+         * `AttachmentEntity.remoteCredentialBindingId`; `ChatViewModel.executeTurnForUserRow`
+         * supplies settings, client and binding from one request session.
+         */
+        internal fun buildFilePartsByMessageId(
+            attachments: List<AttachmentEntity>,
+            isDeepSeek: Boolean,
+            requestCredentialBindingId: String?,
+        ): Map<String, List<ContentPart.File>> {
+            if (!isDeepSeek || attachments.isEmpty()) return emptyMap()
+            val grouped = LinkedHashMap<String, MutableList<ContentPart.File>>()
+            for (attachment in attachments) {
+                if (attachment.kind != AttachmentKind.FILE) continue
+                if (attachment.status == AttachmentStatus.FAILED) continue
+                val messageId = attachment.messageId?.takeIf { it.isNotBlank() } ?: continue
+                if (!canSendFileReference(attachment, isDeepSeek, requestCredentialBindingId)) continue
+                val fileId = attachment.remoteFileId?.takeIf { it.isNotBlank() } ?: continue
+                grouped.getOrPut(messageId) { ArrayList(2) }
+                    .add(ContentPart.File(fileId = fileId, fileName = attachment.fileName))
+            }
+            return grouped
+        }
+
+        /** Historical user rows needing an explicit unavailable marker for one or more file attachments. */
+        internal fun unavailableFileMessageIds(
+            attachments: List<AttachmentEntity>,
+            isDeepSeek: Boolean,
+            requestCredentialBindingId: String?,
+        ): Set<String> {
+            if (!isDeepSeek || attachments.isEmpty()) return emptySet()
+            return attachments.asSequence()
+                .filter { it.kind == AttachmentKind.FILE && it.status != AttachmentStatus.FAILED }
+                .filter { !canSendFileReference(it, isDeepSeek, requestCredentialBindingId) }
+                .mapNotNull { it.messageId?.takeIf(String::isNotBlank) }
+                .toSet()
+        }
+
+        private fun canSendFileReference(
+            attachment: AttachmentEntity,
+            isDeepSeek: Boolean,
+            requestCredentialBindingId: String?,
+        ): Boolean {
+            if (!isDeepSeek || attachment.remoteFileId.isNullOrBlank()) return false
+            val requestBinding = requestCredentialBindingId?.takeIf(String::isNotBlank) ?: return false
+            val attachmentBinding = attachment.remoteCredentialBindingId?.takeIf(String::isNotBlank)
+                ?: return false
+            return attachmentBinding == requestBinding
+        }
+
+        internal fun buildBatonSummaryRequest(
+            model: String,
+            rows: List<MessageEntity>,
+            baseUrl: String,
+        ): ChatRequest {
+            val transcript = buildBatonTranscript(rows)
+            return ChatRequest(
+                model = model,
+                messages = listOf(
+                    ChatMessage(
+                        role = "system",
+                        content = "你是对话编年史整理助手。请把下面的对话记录凝练成一段连贯、克制的剧情与关系梗概，供后续对话作长期背景参考。\n" +
+                            "要求：\n" +
+                            "1. 按时间顺序交代主要事件、关键约定、情绪与关系变化，以及尚未了结的事。\n" +
+                            "2. 用自然连贯的叙述段落，不要逐条罗列流水账，不要编造对话里没有的事实。\n" +
+                            "3. 角色代词用「TA」，称呼用户为「你」。\n" +
+                            "4. 控制在 1500 字以内，只输出梗概正文。",
+                    ),
+                    ChatMessage(role = "user", content = transcript),
+                ),
+                stream = false,
+                jsonMode = false,
+                maxTokens = 1200,
+                temperature = 0.3,
+            ).asInternalRequest(baseUrl)
+        }
+
+        private fun buildBatonTranscript(rows: List<MessageEntity>): String {
+            if (rows.isEmpty()) return "（无对话记录）"
+            val lines = ArrayList<String>(rows.size)
+            var totalChars = 0
+            for (index in rows.lastIndex downTo 0) {
+                val row = rows[index]
+                val speaker = when (row.role) {
+                    MemMessage.ROLE_USER -> "你"
+                    MemMessage.ROLE_ASSISTANT -> "TA"
+                    else -> continue
+                }
+                val rawLine = "$speaker：${row.content.trim()}"
+                if (lines.isNotEmpty() && totalChars + rawLine.length + 1 > BATON_TRANSCRIPT_MAX_CHARS) break
+                val line = if (rawLine.length > BATON_TRANSCRIPT_MAX_CHARS) {
+                    rawLine.take(BATON_TRANSCRIPT_MAX_CHARS)
+                } else {
+                    rawLine
+                }
+                lines.add(line)
+                totalChars += line.length + 1
+                if (totalChars >= BATON_TRANSCRIPT_MAX_CHARS) break
+            }
+            if (lines.isEmpty()) return "（无对话记录）"
+            lines.reverse()
+            return lines.joinToString("\n")
+        }
+
+        internal fun fallbackSummaryPart(index: Int, shard: List<MemMessage>): String =
+            "第 ${index + 1} 段：" + shard.takeLast(6).joinToString("；") { it.content.take(40) }
+
+        internal fun resolveBatonSummary(
+            generatedSummary: String?,
+            fallbackParts: List<String>,
+        ): String =
+            (generatedSummary?.trim()?.takeIf { it.isNotEmpty() } ?: fallbackParts.joinToString("\n"))
+                .take(BATON_SUMMARY_MAX_CHARS)
+
+        /**
+         * 组装结果 → 可发送的 [ChatMessage] 列表（v0.5.0 识图 / v0.6.10 DeepSeek 对齐）。
          *
-         * 规则（依据 `「`content` 从字符串改成数组：
-         * `[{"type":"text","text":用户问题},{"type":"image_url",...}]`」）：
-         * - ⑤ 段（[assembled] 最后一条）带**当轮**图块：正文非空且不是占位 → text 块在**前**，
-         *   图块随后；
-         * - ③ 段里"最近 1 个带图用户轮"（下标 = [historyStart] + [recentImageHistoryIndex]）
-         *   同样带当时正文 + 图块；[recentImageHistoryIndex] < 0 表示没有这一轮；
-         * - 其余消息（更早的图片行等）parts 为空 → `Payloads` 仍按旧行为发字符串
-         *   （更早图片行已被 [promptContentForMessage] 换成「[图片] 原文」占位，保持原样）；
-         * - assistant 永远不带 parts（官方限制：assistant 放图会 400）。
-         *
-         * 正文用 [assembled] 里该条的 `content`（即 ⑤ 段定稿、已按既有 budget 截断的口径），
-         * 不另外引用未截断的原始输入：否则会绕开 `PromptAssembler` 的 ⑤ 段上限，把长文本
-         * 整段塞进请求（token 预算失真）。
-         *
-         * @param assembled `PromptAssembler.assemble` 的输出（[①system][②编年史?][③history...][④system][⑤user]）
-         * @param historyStart ③ 段历史起始下标（[historyStartIndex]）
-         * @param recentImageHistoryIndex 「最近 1 个带图用户轮」在 ③ 段历史里的下标；无则 -1
-         * @param currentImages ⑤ 段（当轮）的图块
-         * @param recentImages ③ 段"最近 1 个带图用户轮"的图块
+         * 保留旧 5 参签名兼容既有测试（`OutgoingMessagesTest`）；新链路通过 [sourceId] 挂载图片与文件。
          */
         internal fun buildOutgoingMessages(
             assembled: List<MemMessage>,
@@ -866,34 +1084,101 @@ class ChatEngine(private val container: AppContainer) {
             currentImages: List<ContentPart.Image>,
             recentImages: List<ContentPart.Image>,
         ): List<ChatMessage> {
-            if (assembled.isEmpty()) return emptyList()
             val recentIndexInAssembled =
                 if (recentImageHistoryIndex >= 0) historyStart + recentImageHistoryIndex else -1
+            return buildOutgoingMessagesInternal(
+                assembled = assembled,
+                isRecentImageMessage = { index, _ -> index == recentIndexInAssembled },
+                currentImages = currentImages,
+                recentImages = recentImages,
+                currentFiles = emptyList(),
+                filePartsByMessageId = emptyMap(),
+            )
+        }
+
+        /**
+         * 组装结果 → 可发送的 [ChatMessage] 列表（按 [MemMessage.sourceId] 与 `lastIndex` 精准挂载多模态块，
+         * 并为 DeepSeek 历史 `assistant` 轮透传 `reasoningContent` 与 `serverToolCallsJson`）。
+         */
+        internal fun buildOutgoingMessages(
+            assembled: List<MemMessage>,
+            recentImageMessageId: String?,
+            currentImages: List<ContentPart.Image>,
+            recentImages: List<ContentPart.Image>,
+            currentFiles: List<ContentPart.File> = emptyList(),
+            filePartsByMessageId: Map<String, List<ContentPart.File>> = emptyMap(),
+        ): List<ChatMessage> = buildOutgoingMessagesInternal(
+            assembled = assembled,
+            isRecentImageMessage = { _, message ->
+                !recentImageMessageId.isNullOrBlank() && message.sourceId == recentImageMessageId
+            },
+            currentImages = currentImages,
+            recentImages = recentImages,
+            currentFiles = currentFiles,
+            filePartsByMessageId = filePartsByMessageId,
+        )
+
+        private inline fun buildOutgoingMessagesInternal(
+            assembled: List<MemMessage>,
+            isRecentImageMessage: (index: Int, message: MemMessage) -> Boolean,
+            currentImages: List<ContentPart.Image>,
+            recentImages: List<ContentPart.Image>,
+            currentFiles: List<ContentPart.File>,
+            filePartsByMessageId: Map<String, List<ContentPart.File>>,
+        ): List<ChatMessage> {
+            if (assembled.isEmpty()) return emptyList()
             return assembled.mapIndexed { index, message ->
-                val parts = when {
-                    index == assembled.lastIndex -> leadingTextThenImages(message.content, currentImages)
-                    index == recentIndexInAssembled -> leadingTextThenImages(message.content, recentImages)
-                    else -> emptyList()
+                val isAssistant = message.role == MemMessage.ROLE_ASSISTANT
+                val isUser = message.role == MemMessage.ROLE_USER
+                val parts = if (!isUser) {
+                    emptyList()
+                } else if (index == assembled.lastIndex) {
+                    buildUserContentParts(
+                        content = message.content,
+                        images = currentImages,
+                        files = currentFiles,
+                    )
+                } else {
+                    val images = if (isRecentImageMessage(index, message)) recentImages else emptyList()
+                    val files = message.sourceId?.let { filePartsByMessageId[it] }.orEmpty()
+                    buildUserContentParts(
+                        content = message.content,
+                        images = images,
+                        files = files,
+                    )
                 }
-                ChatMessage(role = message.role, content = message.content, parts = parts)
+                ChatMessage(
+                    role = message.role,
+                    content = message.content,
+                    parts = parts,
+                    reasoningContent = if (isAssistant) message.reasoningContent else null,
+                    serverToolCallsJson = if (isAssistant) message.serverToolCallsJson else null,
+                )
             }
         }
 
         /**
-         * 把一条带图消息的正文拼成「首个 text 块 + 图块」。
+         * 把带附件（图片 / 文件）的用户消息正文拼成 `content` parts 数组。
          *
-         * 纯图消息（正文为空 / 等于 [IMAGE_PLACEHOLDER]）**只发图块**：占位是我们自己落库用的
-         * 可读正文，不是用户说的话，发给模型会变成"用户说 [图片]"这种噪声。
-         * 无图返回空 parts：调用方据此保持旧字符串行为（字节不变）。
+         * - 无任何附件返回空列表（保持纯字符串 `content`，字节不变）；
+         * - 纯图占位 [IMAGE_PLACEHOLDER] 在有图片时不作为文字块发给模型；
+         * - 其余非空正文作为首个 [ContentPart.Text] 块放在文件/图片前。
          */
-        private fun leadingTextThenImages(
+        private fun buildUserContentParts(
             content: String,
             images: List<ContentPart.Image>,
+            files: List<ContentPart.File>,
         ): List<ContentPart> {
-            if (images.isEmpty()) return emptyList()
+            if (images.isEmpty() && files.isEmpty()) return emptyList()
+            val parts = ArrayList<ContentPart>(1 + files.size + images.size)
             val text = content.trim()
-            if (text.isEmpty() || text == IMAGE_PLACEHOLDER) return images
-            return listOf(ContentPart.Text(content)) + images
+            val omitPlaceholderText = images.isNotEmpty() && text == IMAGE_PLACEHOLDER
+            if (text.isNotEmpty() && !omitPlaceholderText) {
+                parts.add(ContentPart.Text(content))
+            }
+            parts.addAll(files)
+            parts.addAll(images)
+            return parts
         }
 
         /**

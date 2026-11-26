@@ -26,22 +26,22 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * v1 → v2 历史迁移契约测试，并让 Room 执行到当前 v7。
+ * v1 → v2 历史迁移测试，并让 Room 执行到当前 v9。
  *
  * **为什么不用 Room `MigrationTestHelper`**：
  * `androidx.room:room-testing` 不在依赖里（`app/build.gradle.kts` 只有 room-runtime/ktx/compiler），
  * 而本测试的写作用域排除了 build 文件，所以不能加依赖。作为替代，这里用**原生 SQLite 造 v1 库**
  * （SQL 逐字取自 KSP 导出的 v1 schema：`app/schemas/cc.pulsez.app.data.db.PulsezDatabase/1.json`），
- * 再让**真实 Room** 打开该库，沿生产的 1→2→3→4→5→6→7 完整迁移链升级；本类仍逐项锁定 v1→v2
- * 阶段的数据和结构兼容性，Room 同时会按当前 v7 schema 完整校验最终库。
+ * 再让**真实 Room** 打开该库，沿生产的 1→2→3→4→5→6→7→8→9 完整迁移链升级；本类仍逐项锁定 v1→v2
+ * 阶段的数据和结构兼容性，Room 同时会按当前 v9 schema 完整校验最终库。
  *
  * 这比"只执行迁移 SQL 再看列"更强：Room 的 `RoomOpenHelper.onUpgrade` 在跑完迁移后会调用
- * 生成代码里的 `onValidateSchema`，把最终迁移结果和编译期期望的当前 v7 表结构逐列（含 notNull、
+ * 生成代码里的 `onValidateSchema`，把最终迁移结果和编译期期望的当前 v9 表结构逐列（含 notNull、
  * defaultValue、主键位置）、逐索引、逐外键比对，不一致直接抛
  * `IllegalStateException("Migration didn't properly handle: ...")`。
  * Room 2.6.1 `RoomOpenHelper.kt`（onUpgrade → onValidateSchema → "Migration didn't properly handle"）
  * 与 `TableInfo.kt`（Column.equals 比较 notNull / defaultValue）。
- * 所以"测试通过"同时证明了：迁移 SQL 能被 SQLite 执行 + 迁移结果与 v2 实体完全一致 + 旧数据没丢。
+ * 所以"测试通过"同时证明了：迁移 SQL 能被 SQLite 执行 + 迁移结果与当前 v9 schema 一致 + 旧数据没丢。
  *
  * 只用 Robolectric/JVM，不连真机；数据库是临时文件，跑完删除。
  */
@@ -152,7 +152,7 @@ class MigrationV1ToV2Test {
     }
 
     // ------------------------------------------------------------------
-    // 2. 结构：历史相关表保持契约，Room 另外完整校验当前 v7 schema
+    // 2. 结构：历史相关表保持契约，Room 另外完整校验当前 v9 schema
     // ------------------------------------------------------------------
 
     @Test
@@ -166,16 +166,16 @@ class MigrationV1ToV2Test {
             .allowMainThreadQueries()
             .build()
         try {
-            // 触发：migrated 沿 v1→v7 生产链升级；fresh 走当前 v7 onCreate
+            // 触发：migrated 沿 v1→v9 生产链升级；fresh 走当前 v9 onCreate
             migrated.openHelper.writableDatabase
             fresh.openHelper.writableDatabase
-            assertEquals("v1 旧库必须沿生产链升级到当前 v7", 7, migrated.openHelper.writableDatabase.version)
-            assertEquals("全新安装必须是当前 v7", 7, fresh.openHelper.writableDatabase.version)
+            assertEquals("v1 旧库必须沿生产链升级到当前 v9", 9, migrated.openHelper.writableDatabase.version)
+            assertEquals("全新安装必须是当前 v9", 9, fresh.openHelper.writableDatabase.version)
 
             val migratedSchema = schemaSnapshot(migrated)
             val freshSchema = schemaSnapshot(fresh)
             assertEquals(
-                "v1 历史相关表必须与当前库一致（Room 已完整校验最终 v7 schema）",
+                "v1 历史相关表必须与当前库一致（Room 已完整校验最终 v9 schema）",
                 freshSchema,
                 migratedSchema,
             )
@@ -277,7 +277,7 @@ class MigrationV1ToV2Test {
 
     private fun openMigrated(): PulsezDatabase =
         Room.databaseBuilder(context, PulsezDatabase::class.java, MIGRATED_DB_NAME)
-            // DB 当前为 v7：v1 fixture 必须沿完整生产链升级；本测试额外锁定 v1→v2 的旧数据与结构契约。
+            // 当前目标为 v9：v1 fixture 必须沿完整生产链升级；本测试额外锁定 v1→v2 的旧数据与结构契约。
             .addMigrations(
                 PulsezDatabase.MIGRATION_1_2,
                 PulsezDatabase.MIGRATION_2_3,
@@ -285,6 +285,8 @@ class MigrationV1ToV2Test {
                 PulsezDatabase.MIGRATION_4_5,
                 PulsezDatabase.MIGRATION_5_6,
                 PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
             )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()

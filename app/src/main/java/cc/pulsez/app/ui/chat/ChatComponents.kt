@@ -7,13 +7,17 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -76,6 +81,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -84,6 +90,7 @@ import cc.pulsez.app.media.DraftImage
 import cc.pulsez.app.media.DraftStatus
 import cc.pulsez.app.media.ImageMath
 import cc.pulsez.app.media.ThumbnailCache
+import cc.pulsez.app.ui.copy.ChatActionCopy
 import cc.pulsez.app.ui.copy.ImageCopy
 import cc.pulsez.app.ui.copy.ReadCopy
 import cc.pulsez.app.ui.copy.VoiceCopy
@@ -125,6 +132,7 @@ internal const val CHAT_COMPOSER_INPUT_TEST_TAG = "chat-composer-input"
  *
  * 纯图消息（正文是「[图片]」占位）不显示文字气泡，避免空气泡/重复。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun UserMessageBubble(
     text: String,
@@ -132,6 +140,8 @@ fun UserMessageBubble(
     imagePaths: List<String> = emptyList(),
     onOpenImage: (String) -> Unit = {},
     imageMissingLabel: String = ImageCopy.IMAGE_MISSING,
+    fileNames: List<String> = emptyList(),
+    onLongClick: (() -> Unit)? = null,
 ) {
     Row(modifier = modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Column(
@@ -144,29 +154,77 @@ fun UserMessageBubble(
                     localPath = localPath,
                     onOpen = { onOpenImage(localPath) },
                     missingLabel = imageMissingLabel,
+                    onLongClick = onLongClick,
                 )
             }
-            // 「[图片]」是落库占位（导出/降级用），有缩略图时不再显示它，避免空气泡。
-            val visibleText = text.takeIf { it.isNotBlank() && it != ImageCopy.IMAGE_PLACEHOLDER }
+            fileNames.forEach { fileName ->
+                UserFileAttachmentPill(
+                    fileName = fileName,
+                    onLongClick = onLongClick,
+                )
+            }
+            // 「[图片]」/「[文件]」是落库占位（导出/降级用），有对应附件时不再显示空气泡。
+            val isAttachmentPlaceholder =
+                (imagePaths.isNotEmpty() && text == ImageCopy.IMAGE_PLACEHOLDER) ||
+                    (fileNames.isNotEmpty() && text == ChatActionCopy.FILE_PLACEHOLDER)
+            val visibleText = text.takeIf { it.isNotBlank() && !isAttachmentPlaceholder }
             if (visibleText != null) {
+                val bubbleShape = RoundedCornerShape(
+                    topStart = 20.dp,
+                    topEnd = 20.dp,
+                    bottomStart = 20.dp,
+                    bottomEnd = 6.dp,
+                )
                 Text(
                     text = visibleText,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.background,
                     modifier = Modifier
-                        .clip(
-                            RoundedCornerShape(
-                                topStart = 20.dp,
-                                topEnd = 20.dp,
-                                bottomStart = 20.dp,
-                                bottomEnd = 6.dp,
-                            ),
-                        )
+                        .clip(bubbleShape)
                         .background(MaterialTheme.colorScheme.onBackground)
+                        .then(
+                            if (onLongClick != null) {
+                                Modifier.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                            } else {
+                                Modifier
+                            },
+                        )
                         .padding(horizontal = 14.dp, vertical = 10.dp),
                 )
             }
         }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun UserFileAttachmentPill(
+    fileName: String,
+    onLongClick: (() -> Unit)? = null,
+) {
+    val shape = RoundedCornerShape(14.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        modifier = Modifier
+            .clip(shape)
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        Text(
+            text = fileName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        )
     }
 }
 
@@ -176,12 +234,14 @@ fun UserMessageBubble(
  * 文件被清/解码失败 → 显示「图片已删除」占位，不阻塞滚动（研究 §2.3.4）。
  * 触控目标 220dp（远大于 48dp），读屏描述说清"这是你发的图，点开看大图"。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MessageImageThumbnail(
     localPath: String,
     onOpen: () -> Unit,
     missingLabel: String = ImageCopy.IMAGE_MISSING,
     modifier: Modifier = Modifier,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val bitmap = rememberLocalImage(localPath, ImageMath.THUMBNAIL_EDGE)
     val shape = RoundedCornerShape(16.dp)
@@ -190,11 +250,23 @@ fun MessageImageThumbnail(
             .size(width = 220.dp, height = 180.dp)
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable(
-                enabled = bitmap != null,
-                role = Role.Button,
-                onClickLabel = ImageCopy.IMAGE_CONTENT_DESCRIPTION,
-                onClick = onOpen,
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(
+                        enabled = true,
+                        role = Role.Button,
+                        onClickLabel = ImageCopy.IMAGE_CONTENT_DESCRIPTION,
+                        onClick = { if (bitmap != null) onOpen() },
+                        onLongClick = onLongClick,
+                    )
+                } else {
+                    Modifier.clickable(
+                        enabled = bitmap != null,
+                        role = Role.Button,
+                        onClickLabel = ImageCopy.IMAGE_CONTENT_DESCRIPTION,
+                        onClick = onOpen,
+                    )
+                },
             ),
         contentAlignment = Alignment.Center,
     ) {
@@ -870,13 +942,102 @@ private fun DraftImageItem(draft: DraftImage, onRemove: (String) -> Unit) {
     }
 }
 
-// ---------------------------------------------------------------- 选图面板 / 大图预览
+// ---------------------------------------------------------------- 文件草稿条 / 选图文件面板 / 消息操作面板
 
 /**
- * 「拍照 / 从相册选」底部面板（v0.5 识图；沿用 `GroupPickerSheet` 的 `ModalBottomSheet`）。
+ * 普通文件草稿条：仅在有文件草稿时展示紧凑芯片，每项带 48dp 删除按钮。
+ */
+@Composable
+fun FileDraftRow(
+    drafts: List<DraftFile>,
+    onRemove: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    if (drafts.isEmpty()) return
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(start = 16.dp, end = 16.dp, top = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        drafts.forEach { draft ->
+            DraftFileChip(draft = draft, onRemove = onRemove, enabled = enabled)
+        }
+    }
+}
+
+@Composable
+private fun DraftFileChip(
+    draft: DraftFile,
+    onRemove: (String) -> Unit,
+    enabled: Boolean,
+) {
+    val shape = RoundedCornerShape(14.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (draft.status == DraftStatus.FAILED) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.outline
+            },
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .padding(start = 12.dp, end = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Column(modifier = Modifier.widthIn(max = 180.dp)) {
+                Text(
+                    text = draft.fileName,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                when (draft.status) {
+                    DraftStatus.PREPARING -> Text(
+                        text = ChatActionCopy.FILE_DRAFT_PREPARING,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    DraftStatus.FAILED -> Text(
+                        text = ChatActionCopy.FILE_DRAFT_FAILED,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    DraftStatus.READY -> Unit
+                }
+            }
+            IconButton(
+                onClick = { onRemove(draft.id) },
+                enabled = enabled,
+                modifier = Modifier.size(48.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = ChatActionCopy.FILE_DRAFT_REMOVE,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 「拍照 / 从相册选 / 发文件」底部面板（沿用 `GroupPickerSheet` 的 M3 `ModalBottomSheet`）。
  *
- * 返回手势 = 收弹层（自己处理），底部导航条 inset 也由 处理
- * （要求验收"返回一次只收弹层，不退聊天页"）。
+ * 返回手势 = 收弹层（M3 自己处理），底部导航条 inset 也由 M3 处理。
+ * 非识图 DeepSeek 端点下灰显拍照/相册并展示说明，同时保留「发文件」入口。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -884,6 +1045,10 @@ fun ImageSourceSheet(
     onCamera: () -> Unit,
     onGallery: () -> Unit,
     onDismiss: () -> Unit,
+    onFile: (() -> Unit)? = null,
+    imageEnabled: Boolean = true,
+    fileEnabled: Boolean = true,
+    imageDisabledHint: String? = null,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -894,37 +1059,109 @@ fun ImageSourceSheet(
     ) {
         Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
             Text(
-                text = ImageCopy.SOURCE_TITLE,
+                text = when {
+                    onFile != null && !imageEnabled -> ChatActionCopy.ADD_FILE
+                    onFile != null -> ChatActionCopy.ADD_ATTACHMENT
+                    else -> ImageCopy.SOURCE_TITLE
+                },
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp),
             )
             Text(
-                text = ImageCopy.SOURCE_DESCRIPTION,
+                text = if (!imageEnabled && imageDisabledHint != null) {
+                    imageDisabledHint
+                } else {
+                    ImageCopy.SOURCE_DESCRIPTION
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 8.dp),
             )
-            SheetAction(label = ImageCopy.SOURCE_CAMERA, onClick = onCamera)
-            SheetAction(label = ImageCopy.SOURCE_GALLERY, onClick = onGallery)
+            SheetAction(
+                label = ImageCopy.SOURCE_CAMERA,
+                onClick = onCamera,
+                enabled = imageEnabled,
+                dimmed = !imageEnabled,
+            )
+            SheetAction(
+                label = ImageCopy.SOURCE_GALLERY,
+                onClick = onGallery,
+                enabled = imageEnabled,
+                dimmed = !imageEnabled,
+            )
+            if (onFile != null) {
+                SheetAction(
+                    label = ChatActionCopy.SOURCE_FILE,
+                    onClick = onFile,
+                    enabled = fileEnabled,
+                    dimmed = !fileEnabled,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 1:1 聊天消息长按菜单（复制 / 重新生成 / 删除）。每个选项 >= 56dp（满足 >= 48dp 触控规范）。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ChatActionSheet(
+    canCopy: Boolean,
+    canRegenerate: Boolean,
+    canDelete: Boolean,
+    onCopy: () -> Unit,
+    onRegenerate: () -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = if (isSystemInDarkTheme()) DarkSurfaceHigh else LightSurfaceHigh,
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+            if (canCopy) {
+                SheetAction(label = ChatActionCopy.COPY, onClick = onCopy)
+            }
+            if (canRegenerate) {
+                SheetAction(label = ChatActionCopy.REGENERATE, onClick = onRegenerate)
+            }
+            if (canDelete) {
+                SheetAction(
+                    label = ChatActionCopy.DELETE,
+                    onClick = onDelete,
+                    textColor = MaterialTheme.colorScheme.error,
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun SheetAction(label: String, onClick: () -> Unit) {
+private fun SheetAction(
+    label: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    dimmed: Boolean = false,
+    textColor: Color? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 56.dp)
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .alpha(if (enabled && !dimmed) 1f else 0.4f)
             .padding(horizontal = 20.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onBackground,
+            color = textColor ?: MaterialTheme.colorScheme.onBackground,
         )
     }
 }

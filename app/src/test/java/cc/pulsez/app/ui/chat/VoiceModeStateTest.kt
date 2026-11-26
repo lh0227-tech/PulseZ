@@ -13,6 +13,7 @@ import cc.pulsez.app.core.UsageLimits
 import cc.pulsez.app.data.repo.UsageSnapshot
 import cc.pulsez.app.media.DraftImage
 import cc.pulsez.app.media.DraftStatus
+import cc.pulsez.app.net.FilesClient
 import cc.pulsez.app.ui.copy.VoiceCopy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -657,5 +658,71 @@ class VoiceModeStateTest {
         assertEquals(0, state.insertToken)
         assertFalse("默认不在「松手取消」态", state.slideCancelArmed)
         assertFalse(state.isVoiceMode)
+    }
+
+    // ------------------------------------------------------------ v0.6.10 文件草稿与主按钮
+
+    private fun readyFile(id: String = "f1") = DraftFile(
+        id = id,
+        localPath = "attachments/$id.pdf",
+        fileName = "$id.pdf",
+        mime = "application/pdf",
+        sizeBytes = 1024L,
+        purpose = FilesClient.PURPOSE_TEXT_RECOGNITION,
+        status = DraftStatus.READY,
+    )
+
+    private fun preparingFile(id: String = "f-prep") = readyFile(id).copy(status = DraftStatus.PREPARING)
+
+    private fun failedFile(id: String = "f-fail") = readyFile(id).copy(status = DraftStatus.FAILED)
+
+    @Test
+    fun fileDraftRulesEnforceMaxThreeAndIgnoreFailedInQuota() {
+        val three = listOf(readyFile("1"), readyFile("2"), readyFile("3"))
+        assertFalse(FileDraftRules.canAdd(three))
+        assertEquals(3, FileDraftRules.activeCount(three))
+
+        val twoPlusFailed = listOf(readyFile("1"), readyFile("2"), failedFile("bad"))
+        assertTrue("失败文件不占名额", FileDraftRules.canAdd(twoPlusFailed))
+        assertEquals(2, FileDraftRules.activeCount(twoPlusFailed))
+        assertTrue(FileDraftRules.hasReady(twoPlusFailed))
+        assertFalse(FileDraftRules.isPreparing(twoPlusFailed))
+
+        assertTrue(FileDraftRules.isPreparing(listOf(preparingFile())))
+    }
+
+    @Test
+    fun readyFilesOnlyEnableSendAndPreparingOrUploadingDisablesSend() {
+        val readyOnly = ComposerMainButtonResolver.resolve(
+            drafts = emptyList(),
+            hasText = false,
+            streaming = false,
+            mode = ComposerMode.TEXT,
+            fileDrafts = listOf(readyFile()),
+        )
+        assertEquals(ComposerMainIcon.ARROW_UP, readyOnly.icon)
+        assertEquals(ComposerMainAction.SEND, readyOnly.action)
+        assertTrue("只有就绪文件时必须显示可点的发送按钮", readyOnly.enabled)
+
+        val preparingFileState = ComposerMainButtonResolver.resolve(
+            drafts = emptyList(),
+            hasText = true,
+            streaming = false,
+            mode = ComposerMode.TEXT,
+            fileDrafts = listOf(preparingFile()),
+        )
+        assertEquals(ComposerMainIcon.ARROW_UP, preparingFileState.icon)
+        assertFalse("文件准备中必须禁用发送", preparingFileState.enabled)
+
+        val uploadingState = ComposerMainButtonResolver.resolve(
+            drafts = emptyList(),
+            hasText = false,
+            streaming = false,
+            mode = ComposerMode.TEXT,
+            fileDrafts = listOf(readyFile()),
+            uploadingFiles = true,
+        )
+        assertEquals(ComposerMainIcon.ARROW_UP, uploadingState.icon)
+        assertFalse("文件上传中必须禁用发送", uploadingState.enabled)
     }
 }

@@ -2,12 +2,16 @@
 
 package cc.pulsez.app.net
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+
+private const val ROLE_ASSISTANT = "assistant"
+private const val ROLE_LATEST_REMINDER = "latest_reminder"
 
 /**
  * 请求体构造。集中在这里，保证 LlmClient / ModelProbe / EmbeddingClient 对
@@ -32,37 +36,63 @@ internal fun buildChatPayload(
         request.messages.forEach { message ->
             addJsonObject {
                 put("role", message.role)
-                // v0.5.0 识图（依据 「additive parts」）：
-                // - parts 为空 → 旧行为，content 仍是字符串（字节不变，第三方端点零影响）；
-                // - parts 非空 → content 序列化成数组，**原样**按 parts 顺序输出。
-                //   本层不做「正文 → text 块」的补全：那属于 prompt 层策略（纯图占位不能发给模型、
-                //   只有当前轮 / 最近 1 轮带图），统一由 `ChatEngine.buildOutgoingMessages` 决定
-                //   （阻断 修复，ChatEngine.kt` 里有理由说明）。
-                //   所以生产形态是 `[{"type":"text","text":用户问题},{"type":"image_url",...}]`；
-                //   纯图消息 parts 里只有 image，不会发出「[图片]」。
-                // 官方格式：
-                //   {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<...>"}}
-                // `detail:"low"`：官方会先把图缩到 512×512（更快更省），v0.5 默认走 low
-                // （默认 low，先不默认 high）。
-                // 单图 base64 ≤32 MiB、请求体 ≤48 MiB 是官方上限，
-                // 前置校验在发送前由 media 层的体积口径（单图/合计）先挡，不靠服务端 413。
-                if (message.parts.isEmpty()) {
+                if (message.role == ROLE_LATEST_REMINDER) {
+                    // 官方 latest_reminder 协议（https://api-docs.deepseek.com/guides/latest_reminder/）：
+                    // 紧贴 user 消息前，仅序列化 role 与 content。
                     put("content", message.content)
                 } else {
-                    putJsonArray("content") {
-                        message.parts.forEach { part ->
-                            when (part) {
-                                is ContentPart.Text -> addJsonObject {
-                                    put("type", "text")
-                                    put("text", part.text)
-                                }
-                                is ContentPart.Image -> addJsonObject {
-                                    put("type", "image_url")
-                                    putJsonObject("image_url") {
-                                        put("url", "data:image/jpeg;base64," + part.base64Jpeg)
-                                        put("detail", "low")
+                    // 图像请求内容：
+                    // - parts 为空 → 旧行为，content 仍是字符串（字节不变，第三方端点零影响）；
+                    // - parts 非空 → content 序列化成数组，**原样**按 parts 顺序输出。
+                    //   本层不做「正文 → text 块」的补全：那属于 prompt 层策略（纯图占位不能发给模型、
+                    //   只有当前轮 / 最近 1 轮带图），统一由 `ChatEngine.buildOutgoingMessages` 决定
+                    //   具体 parts 组装策略由 `ChatEngine.buildOutgoingMessages` 决定。
+                    //   所以生产形态是 `[{"type":"text","text":用户问题},{"type":"image_url",...}]`；
+                    //   纯图消息 parts 里只有 image，不会发出「[图片]」。
+                    // 示例图像内容 part：
+                    //   {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<...>"}}
+                    // `detail:"low"`：官方会先把图缩到 512×512（更快更省），v0.5 默认走 low
+                    // （res/review-v0.5-plan-product.md N7：默认 low，先不默认 high）。
+                    // 发送前由 media 层校验图片与请求体大小，避免依赖服务端 413。
+                    // 前置校验在发送前由 media 层的体积口径（单图/合计）先挡，不靠服务端 413。
+                    if (message.parts.isEmpty()) {
+                        put("content", message.content)
+                    } else {
+                        putJsonArray("content") {
+                            message.parts.forEach { part ->
+                                when (part) {
+                                    is ContentPart.Text -> addJsonObject {
+                                        put("type", "text")
+                                        put("text", part.text)
+                                    }
+                                    is ContentPart.Image -> addJsonObject {
+                                        put("type", "image_url")
+                                        putJsonObject("image_url") {
+                                            put("url", "data:image/jpeg;base64," + part.base64Jpeg)
+                                            put("detail", "low")
+                                        }
+                                    }
+                                    // 官方 Files API / document_parsing 引用块（https://api-docs.deepseek.com/guides/document_parsing）：
+                                    is ContentPart.File -> addJsonObject {
+                                        put("type", "file")
+                                        put("file_id", part.fileId)
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // DeepSeek 思考 / web_tools 多轮协议（https://api-docs.deepseek.com/guides/web_tools/）：
+                    // assistant 历史轮回传 reasoning_content（允许空串 ""）与原样 server_tool_calls 数组；
+                    // 损坏的非数组历史 JSON 静默忽略，避免污染整轮发送。
+                    if (message.role == ROLE_ASSISTANT) {
+                        message.reasoningContent?.let { put("reasoning_content", it) }
+                        val rawToolCalls = message.serverToolCallsJson?.takeIf { it.isNotBlank() }
+                        if (rawToolCalls != null) {
+                            val array = runCatching {
+                                JsonHttp.json.parseToJsonElement(rawToolCalls) as? JsonArray
+                            }.getOrNull()
+                            if (array != null) {
+                                put("server_tool_calls", array)
                             }
                         }
                     }
@@ -84,8 +114,12 @@ internal fun buildChatPayload(
         putJsonObject("thinking") { put("type", if (enabled) "enabled" else "disabled") }
         if (enabled) put("reasoning_effort", request.reasoningEffort)
     }
-    if (request.webSearch) {
-        putJsonArray("tools") { addJsonObject { put("type", "deepseek_web_search") } }
+    if (request.webSearch || request.readUrl) {
+        // 服务端工具（https://api-docs.deepseek.com/guides/web_tools/）：绝不传 tool_choice。
+        putJsonArray("tools") {
+            if (request.webSearch) addJsonObject { put("type", "deepseek_web_search") }
+            if (request.readUrl) addJsonObject { put("type", "deepseek_read_url") }
+        }
     }
 }.toString()
 

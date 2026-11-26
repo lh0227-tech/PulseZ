@@ -48,10 +48,15 @@ class CopyPolicyTest {
 
     @Test
     fun protocolLayerCarriesHardRulesInPlainWords() {
-        val text = PromptAssembler.buildProtocolLayer(true)
+        val defaultText = PromptAssembler.buildProtocolLayer(true)
+        assertFalse("默认协议层不再要求每轮输出 [[pz: 标签：\n$defaultText", defaultText.contains("[[pz:"))
+        assertFalse("默认协议层不再包含 |rel=：\n$defaultText", defaultText.contains("|rel="))
+
+        val taggedText = PromptAssembler.buildProtocolLayer(true, includeEmotionTag = true)
+        assertTrue("开启标签开关时应含 [[pz:emo=：\n$taggedText", taggedText.contains("[[pz:emo="))
+        assertTrue("开启标签开关时应含 |rel=：\n$taggedText", taggedText.contains("|rel="))
+
         val required = listOf(
-            "[[pz:emo=", // 输出协议标签还在
-            "|rel=",
             "诚实",
             "不是。但你说过的话，我尽量记着。", // 被问"你是真人吗"的固定回答（附录 A 4.11）
             "【人设】",
@@ -61,12 +66,16 @@ class CopyPolicyTest {
             "记错就认",
             "尊重边界",
         )
-        required.forEach { phrase ->
-            assertTrue("协议层缺少关键规则「$phrase」：\n$text", text.contains(phrase))
+        listOf(defaultText, taggedText).forEach { text ->
+            required.forEach { phrase ->
+                assertTrue("协议层缺少关键规则「$phrase」：\n$text", text.contains(phrase))
+            }
+            assertFalse("日常模式协议层不应含「1–3 句」：\n$text", text.contains("1–3 句"))
+            assertFalse("日常模式协议层不应含「40–90」：\n$text", text.contains("40–90"))
         }
-        assertFalse("日常模式协议层不应含「1–3 句」：\n$text", text.contains("1–3 句"))
-        assertFalse("日常模式协议层不应含「40–90」：\n$text", text.contains("40–90"))
+
         val creative = PromptAssembler.buildProtocolLayer(true, creativeMode = true)
+        assertFalse("创作模式默认不输出 [[pz:：\n$creative", creative.contains("[[pz:"))
         assertTrue("创作模式协议层应含「创作模式」：\n$creative", creative.contains("创作模式"))
         assertTrue("创作模式协议层应含「不限字数」：\n$creative", creative.contains("不限字数"))
         assertFalse("创作模式协议层不应含「1–3 句」：\n$creative", creative.contains("1–3 句"))
@@ -75,10 +84,9 @@ class CopyPolicyTest {
 
     @Test
     fun protocolLayerKeepsFullEmoRelEnumContract() {
-        // 回归红线（反馈）：枚举列表 起就是"让界面跟随 TA 的情绪"的输入契约。
-        // 模型看不到合法取值 → 更容易输出 parser 不认识的值 → 界面只能退默认。
-        // 所以在塞 a–f 规则时必须压缩别处，**不能删枚举**。
-        val text = PromptAssembler.buildProtocolLayer(true)
+        // The enum has been part of the input contract since v0.1; keep it available when emotion tags are enabled.
+        // 开启 includeEmotionTag = true 时必须保留完整合法取值枚举，**不能删枚举**。
+        val text = PromptAssembler.buildProtocolLayer(true, includeEmotionTag = true)
         assertTrue("emo 合法取值枚举缺失：\n$text", text.contains("calm happy shy sad angry sleepy surprised smug"))
         assertTrue("rel 合法取值枚举缺失：\n$text", text.contains("distant normal close intimate"))
         assertTrue("emo 必须保留「只取」限定：\n$text", text.contains("emo 只取"))
@@ -87,28 +95,36 @@ class CopyPolicyTest {
 
     @Test
     fun protocolLayerNeverQuotesBannedSentencesAsInstructions() {
-        val text = PromptAssembler.buildProtocolLayer(true)
-        ROLE_SIDE_BANNED.forEach { phrase ->
-            assertFalse("协议层不该原样出现禁用句「$phrase」：\n$text", text.contains(phrase))
-        }
-        PRONOUN_BANNED.forEach { pronoun ->
-            assertFalse("协议层不该出现角色代词「$pronoun」：\n$text", text.contains(pronoun))
+        listOf(false, true).forEach { includeTag ->
+            val text = PromptAssembler.buildProtocolLayer(true, includeEmotionTag = includeTag)
+            ROLE_SIDE_BANNED.forEach { phrase ->
+                assertFalse("协议层不该原样出现禁用句「$phrase」：\n$text", text.contains(phrase))
+            }
+            PRONOUN_BANNED.forEach { pronoun ->
+                assertFalse("协议层不该出现角色代词「$pronoun」：\n$text", text.contains(pronoun))
+            }
         }
     }
 
     @Test
     fun protocolLayerDoesNotGrowBeyondV03Baseline() {
-        listOf(false, true).forEach { creativeMode ->
-            val text = PromptAssembler.buildProtocolLayer(true, creativeMode = creativeMode)
-            assertTrue(
-                "协议层(creative=$creativeMode)字符数 ${text.length} 超过基线 $PROTOCOL_CHARS_BASELINE",
-                text.length <= PROTOCOL_CHARS_BASELINE,
-            )
-            val tokens = TokenEstimator.estimate(text)
-            assertTrue(
-                "协议层(creative=$creativeMode) token $tokens 超过基线 $PROTOCOL_TOKENS_BASELINE",
-                tokens <= PROTOCOL_TOKENS_BASELINE,
-            )
+        listOf(false, true).forEach { includeTag ->
+            listOf(false, true).forEach { creativeMode ->
+                val text = PromptAssembler.buildProtocolLayer(
+                    protocolEnabled = true,
+                    creativeMode = creativeMode,
+                    includeEmotionTag = includeTag,
+                )
+                assertTrue(
+                    "协议层(creative=$creativeMode,tag=$includeTag)字符数 ${text.length} 超过基线 $PROTOCOL_CHARS_BASELINE",
+                    text.length <= PROTOCOL_CHARS_BASELINE,
+                )
+                val tokens = TokenEstimator.estimate(text)
+                assertTrue(
+                    "协议层(creative=$creativeMode,tag=$includeTag) token $tokens 超过基线 $PROTOCOL_TOKENS_BASELINE",
+                    tokens <= PROTOCOL_TOKENS_BASELINE,
+                )
+            }
         }
     }
 
@@ -116,6 +132,7 @@ class CopyPolicyTest {
     fun protocolLayerDisabledStillProducesNothing() {
         assertEquals("", PromptAssembler.buildProtocolLayer(false))
         assertEquals("", PromptAssembler.buildProtocolLayer(false, creativeMode = true))
+        assertEquals("", PromptAssembler.buildProtocolLayer(false, includeEmotionTag = true))
     }
 
     // ---------------------------------------------------------------- 尾锚

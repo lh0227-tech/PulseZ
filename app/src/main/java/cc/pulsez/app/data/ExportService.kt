@@ -189,6 +189,8 @@ object ExportService {
                                 // v0.5.2：段归属与用量，恢复时要还原到对应段。
                                 put("segmentId", message.segmentId)
                                 put("tokens", message.tokens)
+                                message.citationsJson?.let { put("citationsJson", it) }
+                                message.latestReminder?.let { put("latestReminder", it) }
                             },
                         )
                     }
@@ -619,14 +621,18 @@ object ExportService {
         withContext(Dispatchers.IO) {
             // ① 先 fail-fast，再动 DB（避免清了一半才发现附件目录没准备好）。
             val attachments = AttachmentStore.required()
-            // ② 库（含附件表）。
+            // ② Room 清 entity 表；SQLite AFTER DELETE trigger 把远端 file ID + 本机凭据绑定 ID
+            // 原子转存到独立 raw queue。Room 的 clearAllTables 只清注册实体：
+            // https://developer.android.com/reference/androidx/room/RoomDatabase#clearAllTables()
             container.database.clearAllTables()
             // ③ 设置：单次 edit，保留协议同意记录；先失效密钥标志，再删密文（B ③→⑤）。
             container.settings.wipeUserData()
             // ④ 导入偏好（续导线索/整理进度/「已整理」标记）+ 群聊账本。
             container.importPrefs.clearAll()
             container.groupLedger.clearAll()
-            // ⑤ 密文：删除与回读任一 IO 失败都按附件存储错误上抛，不能把未知状态当成「不存在」。
+            // ⑤ API 密文：删除与回读任一 IO 失败都按附件存储错误上抛，不能把未知状态当成「不存在」。
+            // 独立的远端文件 HMAC 绑定 alias 不属于 SecretStore，必须留存以便重新填入同一端点/凭据后重试；
+            // Keystore alias 丢失时 binding 退为未知，不生成替代 key 来匹配旧记录。
             // 依据：util/SecretStore.kt 的 clear() 核验文件/alias；AttachmentStore.kt:40-44 支持保留 cause。
             try {
                 clearSecrets()

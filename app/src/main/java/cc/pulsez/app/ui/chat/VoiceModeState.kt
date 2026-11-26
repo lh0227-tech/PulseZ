@@ -5,6 +5,7 @@ import cc.pulsez.app.audio.VoiceInputState
 import cc.pulsez.app.audio.VoiceQuotaDecision
 import cc.pulsez.app.media.DraftImage
 import cc.pulsez.app.media.DraftRules
+import cc.pulsez.app.media.DraftStatus
 import cc.pulsez.app.ui.copy.VoiceCopy
 
 /**
@@ -82,6 +83,41 @@ data class ComposerMainButton(
  * 仍优先于语音模式切换。此时语音模式**没有**键盘主按钮，
  * 由 `ChatComposer` 在第二行同一位置补一个独立的「切换至键盘」48dp 按钮保证用户能切回（不推翻主按钮解析）。
  */
+/**
+ * 输入条里的普通文件草稿（UI 状态，对应 DB `AttachmentKind.FILE`；v0.6.10）。
+ */
+data class DraftFile(
+    val id: String,
+    val localPath: String,
+    val fileName: String,
+    val mime: String,
+    val sizeBytes: Long,
+    val purpose: String,
+    val status: DraftStatus,
+    val errorCode: String? = null,
+    val remoteFileId: String? = null,
+)
+
+/**
+ * 普通文件草稿规则：一轮最多 3 个文件、准备中禁止发送、失败态不占名额也不阻塞打字发送。
+ */
+object FileDraftRules {
+
+    const val MAX_FILES: Int = 3
+
+    fun canAdd(drafts: List<DraftFile>): Boolean =
+        drafts.count { it.status != DraftStatus.FAILED } < MAX_FILES
+
+    fun activeCount(drafts: List<DraftFile>): Int =
+        drafts.count { it.status != DraftStatus.FAILED }
+
+    fun isPreparing(drafts: List<DraftFile>): Boolean =
+        drafts.any { it.status == DraftStatus.PREPARING }
+
+    fun hasReady(drafts: List<DraftFile>): Boolean =
+        drafts.any { it.status == DraftStatus.READY }
+}
+
 object ComposerMainButtonResolver {
 
     fun resolve(
@@ -91,8 +127,10 @@ object ComposerMainButtonResolver {
         mode: ComposerMode,
         voiceEntryVisible: Boolean = true,
         frozen: Boolean = false,
+        fileDrafts: List<DraftFile> = emptyList(),
+        uploadingFiles: Boolean = false,
     ): ComposerMainButton {
-        // 先复用既有发送/停止状态机（含「图片准备中禁用发送」），只改「空输入」这一支。
+        // 先复用既有发送/停止状态机（含「图片准备中禁用发送」），只改「空输入」与「文件草稿」分支。
         val send = ComposerPrimary.resolve(drafts = drafts, hasText = hasText, streaming = streaming)
         if (frozen) {
             return ComposerMainButton(
@@ -102,6 +140,8 @@ object ComposerMainButtonResolver {
                 contentDescription = send.contentDescription,
             )
         }
+        val anyPreparing = DraftRules.isPreparing(drafts) || FileDraftRules.isPreparing(fileDrafts)
+        val hasReadyAttachment = DraftRules.hasReady(drafts) || FileDraftRules.hasReady(fileDrafts)
         return when {
             send.action == ComposerPrimaryAction.STOP -> ComposerMainButton(
                 icon = ComposerMainIcon.STOP,
@@ -109,14 +149,20 @@ object ComposerMainButtonResolver {
                 enabled = true,
                 contentDescription = send.contentDescription,
             )
-            hasText || DraftRules.hasReady(drafts) -> ComposerMainButton(
+            uploadingFiles -> ComposerMainButton(
                 icon = ComposerMainIcon.ARROW_UP,
                 action = ComposerMainAction.SEND,
-                enabled = send.enabled,
+                enabled = false,
                 contentDescription = send.contentDescription,
             )
-            // 语音入口被门禁隐藏（非 DeepSeek 端点 / 没聊天密钥 / 没麦克风）时，空输入退回
-            // 空输入且语音入口不可用时显示禁用的发送箭头，不显示无法使用的麦克风按钮。
+            hasText || hasReadyAttachment -> ComposerMainButton(
+                icon = ComposerMainIcon.ARROW_UP,
+                action = ComposerMainAction.SEND,
+                enabled = !anyPreparing,
+                contentDescription = send.contentDescription,
+            )
+            // 语音入口被门禁隐藏（非 DeepSeek 端点 / 没密钥 / 没麦克风）时，空输入退回
+            // 空输入且语音入口不可用时显示禁用的发送箭头，避免留下不可用的麦克风按钮。
             !voiceEntryVisible -> ComposerMainButton(
                 icon = ComposerMainIcon.ARROW_UP,
                 action = ComposerMainAction.SEND,

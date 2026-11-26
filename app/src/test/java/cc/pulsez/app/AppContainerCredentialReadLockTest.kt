@@ -382,4 +382,42 @@ class AppContainerCredentialReadLockTest {
         )
         assertEquals("守卫拦下时零请求", 0, server.requestCount)
     }
+
+    @Test
+    fun `聊天端点会话固定同一轮读取的地址模型设置且不泄漏密钥`() = runBlocking {
+        val container = newContainer()
+        assertEquals(
+            CredentialSaveResult.SAVED,
+            container.saveChatCredential(DEEPSEEK, "deepseek-chat", PLACEHOLDER_KEY_A),
+        )
+
+        val first = container.resolvedChatEndpoint() ?: error("已保存的测试凭据应能解析出聊天会话")
+        val firstSettings = first.settingsSnapshot ?: error("解析出的生产会话应携带读取时设置快照")
+        assertEquals(DEEPSEEK, first.baseUrl)
+        assertEquals(DEEPSEEK, firstSettings.chatBaseUrl)
+        assertEquals("deepseek-chat", firstSettings.chatModel)
+        assertEquals(PLACEHOLDER_KEY_A, first.apiKey)
+
+        assertEquals(
+            CredentialSaveResult.SAVED,
+            container.saveChatCredential(DEEPSEEK_V1, "deepseek-reasoner", PLACEHOLDER_KEY_B),
+        )
+        val second = container.resolvedChatEndpoint() ?: error("轮换后的测试凭据应能解析出聊天会话")
+        val secondSettings = second.settingsSnapshot ?: error("轮换后的生产会话应携带读取时设置快照")
+
+        // 第一次返回的会话保留端点、模型和密钥同一快照；凭据轮换不能改写已返回对象。
+        assertEquals(DEEPSEEK, first.baseUrl)
+        assertEquals("deepseek-chat", firstSettings.chatModel)
+        assertEquals(DEEPSEEK, firstSettings.chatBaseUrl)
+        assertEquals(PLACEHOLDER_KEY_A, first.apiKey)
+        assertEquals(DEEPSEEK_V1, second.baseUrl)
+        assertEquals(DEEPSEEK_V1, secondSettings.chatBaseUrl)
+        assertEquals("deepseek-reasoner", secondSettings.chatModel)
+        assertEquals(PLACEHOLDER_KEY_B, second.apiKey)
+
+        assertFalse(first.toString().contains(PLACEHOLDER_KEY_A))
+        assertFalse(second.toString().contains(PLACEHOLDER_KEY_B))
+        assertFalse(firstSettings.toString().contains(PLACEHOLDER_KEY_A))
+        assertFalse(secondSettings.toString().contains(PLACEHOLDER_KEY_B))
+    }
 }

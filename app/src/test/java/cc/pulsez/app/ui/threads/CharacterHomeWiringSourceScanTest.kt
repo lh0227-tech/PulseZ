@@ -12,6 +12,7 @@ class CharacterHomeWiringSourceScanTest {
     private val screenText by lazy { File(SCREEN_PATH).readText(Charsets.UTF_8) }
     private val appRootText by lazy { File(APP_ROOT_PATH).readText(Charsets.UTF_8) }
     private val chatViewModelText by lazy { File(CHAT_VIEW_MODEL_PATH).readText(Charsets.UTF_8) }
+    private val repositoriesText by lazy { File(REPOSITORIES_PATH).readText(Charsets.UTF_8) }
     private val importViewModelText by lazy { File(IMPORT_VIEW_MODEL_PATH).readText(Charsets.UTF_8) }
     private val groupViewModelText by lazy { File(GROUP_VIEW_MODEL_PATH).readText(Charsets.UTF_8) }
 
@@ -47,14 +48,41 @@ class CharacterHomeWiringSourceScanTest {
     }
 
     @Test
-    fun onlyThePersistedLiveSingleChatUserPathOptsIntoActivity() {
-        val appendAt = chatViewModelText.indexOf("val userRow = container.chat.append(")
-        val requestAt = chatViewModelText.indexOf("val client = container.llmClient()", appendAt)
-        assertTrue("用户消息写入路径必须存在", appendAt >= 0)
-        assertTrue("用户消息先落库、后启动请求", requestAt > appendAt)
-        val persistBlock = chatViewModelText.substring(appendAt, requestAt)
-        assertTrue(persistBlock.contains("role = \"user\""))
-        assertTrue(persistBlock.contains("recordSingleChatActivity = true"))
+    fun onlyThePersistedLiveSingleChatUserPathOptsIntoActivityAndUsesOneSession() {
+        val runTurnStart = chatViewModelText.indexOf("private suspend fun runTurn(")
+        val runTurnEnd = chatViewModelText.indexOf("private suspend fun executeTurnForUserRow(", runTurnStart)
+        assertTrue("发送轮次和执行请求的源码区块必须存在", runTurnStart >= 0 && runTurnEnd > runTurnStart)
+        val runTurnBlock = chatViewModelText.substring(runTurnStart, runTurnEnd)
+        val appendAt = runTurnBlock.indexOf("container.chat.appendUserForTurn(")
+        val persistedRowCheck = runTurnBlock.indexOf("if (userRow == null) return", appendAt)
+        val requestAt = runTurnBlock.indexOf("executeTurnForUserRow(", persistedRowCheck)
+        assertTrue("live user append 必须存在", appendAt >= 0)
+        assertTrue("返回 null 时不能启动请求", persistedRowCheck > appendAt)
+        assertTrue("用户消息先持久化、再启动请求", requestAt > persistedRowCheck)
+        val runTurnCall = runTurnBlock.substring(requestAt)
+        assertTrue("请求沿用发送时捕获的 attempt", runTurnCall.contains("acceptedSendAttempt = attempt"))
+
+        val appendMethodStart = repositoriesText.indexOf("suspend fun appendUserForTurn(")
+        val appendMethodEnd = repositoriesText.indexOf("suspend fun appendAssistantForTurn(", appendMethodStart)
+        assertTrue("事务性用户 append 仓储必须存在", appendMethodEnd > appendMethodStart)
+        val appendMethod = repositoriesText.substring(appendMethodStart, appendMethodEnd)
+        assertTrue("该仓储只创建 user 行", appendMethod.contains("role = \"user\""))
+        val rowWriteAt = appendMethod.indexOf("db.messageDao().upsert(message)")
+        val activityAt = appendMethod.indexOf("recordSingleChatActivity(threadId", rowWriteAt)
+        assertTrue("单聊活动必须随用户行同事务写入", rowWriteAt >= 0 && activityAt > rowWriteAt)
+
+        val executeStart = chatViewModelText.indexOf("private suspend fun executeTurnForUserRow(")
+        val executeEnd = chatViewModelText.indexOf("private fun restoreRegeneratedAssistant(", executeStart)
+        assertTrue("请求执行源码区块必须存在", executeEnd > executeStart)
+        val executeBlock = chatViewModelText.substring(executeStart, executeEnd)
+        val sessionAt = executeBlock.indexOf("val session = resolveChatEndpoint()")
+        val clientAt = executeBlock.indexOf("LlmClient(container.http, session.baseUrl, session.apiKey)")
+        val prepareAt = executeBlock.indexOf("container.engine.prepare(")
+        assertTrue("请求客户端必须使用已解析 session", sessionAt >= 0 && clientAt > sessionAt)
+        assertTrue("上下文组装必须使用同一 session", prepareAt > sessionAt)
+        assertTrue(executeBlock.contains("requestSettings = turnSettings"))
+        assertTrue(executeBlock.contains("remoteCredentialBindingId = session.remoteCredentialBindingId"))
+        assertTrue(executeBlock.contains("uploadedFileBindingId != session.remoteCredentialBindingId?.takeIf"))
         assertFalse("历史导入不得显式推进真实活动", importViewModelText.contains("recordSingleChatActivity = true"))
         assertFalse("群聊不得显式推进单聊活动", groupViewModelText.contains("recordSingleChatActivity = true"))
     }
@@ -64,6 +92,7 @@ class CharacterHomeWiringSourceScanTest {
         const val SCREEN_PATH = "src/main/java/cc/pulsez/app/ui/threads/ThreadsScreen.kt"
         const val APP_ROOT_PATH = "src/main/java/cc/pulsez/app/ui/AppRoot.kt"
         const val CHAT_VIEW_MODEL_PATH = "src/main/java/cc/pulsez/app/ui/chat/ChatViewModel.kt"
+        const val REPOSITORIES_PATH = "src/main/java/cc/pulsez/app/data/repo/Repositories.kt"
         const val IMPORT_VIEW_MODEL_PATH = "src/main/java/cc/pulsez/app/ui/importer/ImportViewModel.kt"
         const val GROUP_VIEW_MODEL_PATH = "src/main/java/cc/pulsez/app/ui/group/GroupChatViewModel.kt"
     }

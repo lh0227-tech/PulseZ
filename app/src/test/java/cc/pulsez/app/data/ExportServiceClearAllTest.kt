@@ -180,10 +180,11 @@ class ExportServiceClearAllTest {
                     status = AttachmentStatus.DRAFT,
                     errorKind = null,
                     attempts = 0,
-                    remoteFileId = null,
+                    remoteFileId = "wipe-remote-id",
                     expiresAt = null,
                     deletedAt = null,
                     createdAt = 1L,
+                    remoteCredentialBindingId = "wipe-local-binding",
                 ),
             )
             assertTrue("预置：附件表有行", container.database.attachmentDao().idsInUse().isNotEmpty())
@@ -234,6 +235,22 @@ class ExportServiceClearAllTest {
                 "附件表要空（clearAllTables 物理清）",
                 container.database.attachmentDao().idsInUse().isEmpty(),
             )
+            assertEquals(
+                "清空仅保留可安全重试远端删除的两字段最小记录",
+                listOf("wipe-remote-id"),
+                container.remoteFileCleanup.pendingFor("wipe-local-binding"),
+            )
+            val retainedCleanup = container.remoteFileCleanup.entries().single()
+            assertEquals("wipe-remote-id", retainedCleanup.remoteFileId)
+            assertEquals("wipe-local-binding", retainedCleanup.credentialBindingId)
+            val cleanupColumns = container.database.openHelper.writableDatabase
+                .query("PRAGMA table_info(`remote_file_cleanup`)").use { cursor ->
+                    buildSet {
+                        val nameIndex = cursor.getColumnIndexOrThrow("name")
+                        while (cursor.moveToNext()) add(cursor.getString(nameIndex))
+                    }
+                }
+            assertEquals(setOf("remoteFileId", "credentialBindingId"), cleanupColumns)
 
             // ---- 附件目录与三个缓存目录：空或不存在 ----
             assertTrue("附件目录要空", store.dir.listFiles().isNullOrEmpty())

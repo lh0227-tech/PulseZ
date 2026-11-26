@@ -43,6 +43,23 @@ class AppRootWipeWiringSourceScanTest {
     private fun occurrences(text: String, needle: String): Int =
         Regex(Regex.escape(needle)).findAll(text).count()
 
+    /** Return the end of the balanced call beginning at [callStart], including its closing `)`. */
+    private fun callEnd(text: String, callStart: Int): Int {
+        val open = text.indexOf('(', callStart)
+        if (open < 0) return -1
+        var depth = 0
+        for (index in open until text.length) {
+            when (text[index]) {
+                '(' -> depth += 1
+                ')' -> {
+                    depth -= 1
+                    if (depth == 0) return index + 1
+                }
+            }
+        }
+        return -1
+    }
+
     /** `ClearOutcome.RETURN_HOME` 分支正文（到下一个 `ClearOutcome.` 为止）。 */
     private fun clearSuccessBranch(): String {
         val start = appRootText.indexOf("ClearOutcome.RETURN_HOME")
@@ -273,23 +290,39 @@ class AppRootWipeWiringSourceScanTest {
         val sendBlock = chatVmText.substring(sendStart, sendInternalStart)
         val attemptStart = sendBlock.indexOf("val attempt = SendAttempt(")
         val activeAttemptIndex = sendBlock.indexOf("activeSendAttempt = attempt", attemptStart)
-        val sendLaunchIndex = sendBlock.indexOf("viewModelScope.launch", activeAttemptIndex)
+        val preparationLaunchIndex = sendBlock.indexOf("launchSendPreparation(attempt) {", activeAttemptIndex)
         assertTrue(
-            "ChatViewModel send() 必须先同步构造发送尝试并保存，再启动异步发送",
-            attemptStart >= 0 && activeAttemptIndex > attemptStart && sendLaunchIndex > activeAttemptIndex,
+            "ChatViewModel send() 必须先同步构造并保存发送尝试，再交给发送准备 helper",
+            attemptStart >= 0 && activeAttemptIndex > attemptStart && preparationLaunchIndex > activeAttemptIndex,
         )
         val attemptBlock = sendBlock.substring(attemptStart, activeAttemptIndex)
         val capturedEpochIndex = attemptBlock.indexOf("wipeEpoch = container.wipeEpoch.value")
         assertTrue(
-            "ChatViewModel 必须在发送尝试构造时同步捕获清空代际，且发生在 viewModelScope.launch 前",
-            capturedEpochIndex >= 0 && attemptStart + capturedEpochIndex < sendLaunchIndex,
+            "ChatViewModel 必须在发送尝试构造时同步捕获清空代际，且发生在准备 helper 前",
+            capturedEpochIndex >= 0 && attemptStart + capturedEpochIndex < preparationLaunchIndex,
+        )
+        val preparationHelperStart = chatVmText.indexOf("private fun launchSendPreparation(attempt: SendAttempt")
+        val consumeAttemptStart = chatVmText.indexOf("private fun consumeSendAttempt(", preparationHelperStart)
+        assertTrue(
+            "ChatViewModel 必须有独立的 launchSendPreparation helper",
+            preparationHelperStart >= 0 && consumeAttemptStart > preparationHelperStart,
+        )
+        val preparationHelper = chatVmText.substring(preparationHelperStart, consumeAttemptStart)
+        val lazyJobStart = preparationHelper.indexOf("viewModelScope.launch(start = CoroutineStart.LAZY)")
+        val jobAssignment = preparationHelper.indexOf("sendPreparationJob = job", lazyJobStart)
+        val ownerAssignment = preparationHelper.indexOf("sendPreparationJobOwnerId = attempt.id", jobAssignment)
+        val jobStart = preparationHelper.indexOf("job.start()", ownerAssignment)
+        assertTrue(
+            "发送准备 helper 必须先创建 LAZY job、登记 job 与 owner，再启动 job",
+            lazyJobStart >= 0 && jobAssignment > lazyJobStart && ownerAssignment > jobAssignment && jobStart > ownerAssignment,
         )
         val runTurnDefinitionStart = chatVmText.indexOf("private suspend fun runTurn(", sendInternalStart)
         assertTrue("找不到 runTurn 定义以界定 sendInternal 区块", runTurnDefinitionStart > sendInternalStart)
         val sendInternalBlock = chatVmText.substring(sendInternalStart, runTurnDefinitionStart)
         val runTurnCallStart = sendInternalBlock.indexOf("runTurn(")
         val streamLaunchStart = sendInternalBlock.lastIndexOf("streamJob = viewModelScope.launch", runTurnCallStart)
-        val runTurnCallEnd = sendInternalBlock.indexOf("\n            )", runTurnCallStart)
+        assertTrue("sendInternal 流任务必须调用 runTurn", runTurnCallStart >= 0)
+        val runTurnCallEnd = callEnd(sendInternalBlock, runTurnCallStart)
         assertTrue(
             "sendInternal 必须在流任务内调用 runTurn，并传入同一发送尝试捕获的代际",
             streamLaunchStart >= 0 && runTurnCallStart > streamLaunchStart && runTurnCallEnd > runTurnCallStart &&
@@ -303,9 +336,13 @@ class AppRootWipeWiringSourceScanTest {
         val finishedBlock = chatVmText.substring(finishedStart, failedStart)
         val guardIndex = finishedBlock.indexOf("wipeChangedSince(wipeEpoch)")
         assertTrue("LlmEvent.Finished 分支内必须有清空代际守卫", guardIndex >= 0)
-        val appendIndex = finishedBlock.indexOf("container.chat.append(")
+        val appendIndex = finishedBlock.indexOf("container.chat.appendAssistantForTurn(")
         assertTrue("Finished 分支必须有 assistant 落库", appendIndex > guardIndex)
         assertTrue("守卫必须在落库之前（不能先写库再判断）", guardIndex < appendIndex)
+        assertTrue(
+            "Finished assistant append 必须在事务内复核同一轮清空代际",
+            finishedBlock.contains("canBeginCommit = {") && finishedBlock.contains("canContinue = {"),
+        )
         assertTrue(
             "记账/索引/维护的 appScope 启动块也要按代际收口（第二层）",
             chatVmText.contains("if (wipeChangedSince(wipeEpoch)) return@launch"),

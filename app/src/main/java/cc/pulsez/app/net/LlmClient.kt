@@ -15,8 +15,12 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -72,6 +76,9 @@ class LlmClient(
 
     /** 用户配置的归一化 base（缓存键，不随 /v1 解析改变）。*/
     private val configuredBaseUrl: String = BaseUrl.normalize(baseUrl)
+
+    /** DeepSeek 的终态安全拒绝必须撤下之前已经流出的内容；其它兼容端点保留原行为。 */
+    private val deepSeekApiEndpoint: Boolean = DeepSeekEndpoint.matches(configuredBaseUrl)
 
     @Volatile
     private var resolvedBaseUrl: String = BaseUrl.initial(baseUrl)
@@ -144,19 +151,25 @@ class LlmClient(
             var finishReason: String? = null
             var usage: Usage? = null
             var failure: ApiError? = null
-            // v0.5.0 识图：服务商对图片的内容安全拒绝。
-            // 两种形态都要当「图片被服务商拒绝」而不是普通空回答：
-            // 1. 流式 `delta.refusal`（OpenAI 兼容形态）；
-            // 2. `finish_reason = "content_filter"` 且没有正文。
-            // 上层按 ApiError.Filtered 换人话（media/发送链路），**不冒称危机干预**。
+            // 服务商的拒绝信号。DeepSeek 终态拒绝时即使已流出正文也必须按 Filtered 收尾；
+            // 其它兼容端点仍只在无正文时按旧行为处理。图片场景的用户提示由发送链路处理。
             var refusalSeen = false
             var sawContent = false
             // 带联网工具的请求被 400 拒绝后，是否已经做过一次"去掉 tools"的降级重试。
             // 独立布尔量（不复用 attempts）保证**只降级一次**，不会因为 404/stream_options 也重试过而漏掉或重试两次。
             var webSearchDropped = false
-            // 联网搜索的引用：流式下完整 annotations 只在最后一帧下发。
-            // 用 LinkedHashMap 按 url 去重且保持顺序（同一条来源可能重复出现）。
-            val citations = LinkedHashMap<String, Citation>()
+            // 联网搜索 / 思考多轮协议（https://api-docs.deepseek.com/guides/web_tools/）：
+            // - 思考开启时每步传 reasoning_content（无新思考步为 ""），收到 step_reasoning_done 时推进末步偏移，
+            //   使存在 server_tool_calls 时只回传最后一步推理（含 ""）；
+            // - 思考关闭时不传 reasoning_content，仅当流内出现推理信号（sawReasoningSignal）时才切片返回，
+            //   纯联网非思考轮次返回 null；无工具轮若非空也返回供持久化展示。
+            val fullReasoningBuffer = StringBuilder()
+            var lastStepReasoningOffset = 0
+            var sawReasoningSignal = false
+            var serverToolCallsJson: String? = null
+            // Search citations are de-duplicated by (url, startIndex, endIndex) while preserving order,
+            // This preserves repeated references to the same URL at distinct text positions.
+            val citations = LinkedHashMap<Triple<String, Int?, Int?>, Citation>()
 
             try {
                 var urlBase = resolvedBaseUrl
@@ -216,12 +229,12 @@ class LlmClient(
                         // **保留思考设置**。依据 与 。
                         // 只降级一次；降级后仍失败就走下面的正常错误分类（或 stream_options 回退）。
                         if (code == 400 &&
-                            activeRequest.webSearch &&
+                            (activeRequest.webSearch || activeRequest.readUrl) &&
                             !webSearchDropped &&
                             isWebSearchRejection(errorBody)
                         ) {
                             webSearchDropped = true
-                            activeRequest = activeRequest.copy(webSearch = false)
+                            activeRequest = activeRequest.copy(webSearch = false, readUrl = false)
                             attempts++
                             continue
                         }
@@ -321,12 +334,47 @@ class LlmClient(
                                         sawContent = true
                                         emit(LlmEvent.Delta(content))
                                     }
-                                    // `delta.refusal`：图片/内容被服务商安全策略挡下。
-                                    // 不把它当正文；只在"整轮没正文"时判成 Filtered（见下方终态判定）。
+                                    // `delta.refusal` 是拒绝信号，不当正文；DeepSeek 可能在已流出前缀后才发送它。
                                     if (!delta?.stringOrNull("refusal").isNullOrEmpty()) refusalSeen = true
                                     val reasoning = delta?.stringOrNull("reasoning_content")
                                         ?: delta?.stringOrNull("reasoning")
-                                    if (!reasoning.isNullOrEmpty()) emit(LlmEvent.Reasoning(reasoning))
+                                    if (delta != null &&
+                                        (delta.hasNonNull("reasoning_content") || delta.hasNonNull("reasoning"))
+                                    ) {
+                                        sawReasoningSignal = true
+                                    }
+                                    if (!reasoning.isNullOrEmpty()) {
+                                        fullReasoningBuffer.append(reasoning)
+                                        sawReasoningSignal = true
+                                        emit(LlmEvent.Reasoning(reasoning))
+                                    }
+                                    // 服务端工具进度（https://api-docs.deepseek.com/guides/web_tools/）：
+                                    // step_reasoning_done 标记上一步思考结束，推进末步推理切片偏移并记录思考信号；
+                                    // call_started / call_completed 发射 ToolProgress 供 UI 展示实时进度。
+                                    val toolEvent = choice["server_tool_event"] as? JsonObject
+                                    if (toolEvent != null) {
+                                        when (toolEvent.stringOrNull("type")) {
+                                            "step_reasoning_done" -> {
+                                                sawReasoningSignal = true
+                                                lastStepReasoningOffset = fullReasoningBuffer.length
+                                            }
+                                            "call_started", "call_completed" -> {
+                                                val eventType = toolEvent.stringOrNull("type").orEmpty()
+                                                parseToolProgress(toolEvent["call"] as? JsonObject, eventType)
+                                                    ?.let { emit(it) }
+                                            }
+                                        }
+                                    }
+                                    // 末帧 server_tool_calls（流式 delta 或非流式 message / choice）：原样保存 JSON 数组（含 signature）。
+                                    val rawServerToolCalls = delta?.get("server_tool_calls")?.asArrayOrNull()
+                                        ?: message?.get("server_tool_calls")?.asArrayOrNull()
+                                        ?: choice["server_tool_calls"]?.asArrayOrNull()
+                                    if (rawServerToolCalls != null && rawServerToolCalls.isNotEmpty()) {
+                                        serverToolCallsJson = JsonHttp.json.encodeToString(
+                                            JsonArray.serializer(),
+                                            rawServerToolCalls,
+                                        )
+                                    }
                                     // 联网搜索引用：官方流式只在最后一帧下发完整 annotations。
                                     // 兼容三种可能的位置：message.annotations（非流式形态）、
                                     // delta.annotations、以及 choice 级 annotations。
@@ -361,17 +409,37 @@ class LlmClient(
             }
 
             terminal = when {
-                // v0.5.0 识图：图片被服务商安全策略拒绝（content_filter / delta.refusal 且无正文）。
-                // 归到 ApiError.Filtered，让发送链路换成「这张图服务商不收……」的人话。
-                failure == null && !sawContent && (refusalSeen || finishReason == "content_filter") ->
+                // DeepSeek 安全复核会等完整输出后才给终态拒绝；此时前缀可能已流到 UI，
+                // 因此正文是否为空都必须按失败收尾，由上层撤下正文/思考/引用。
+                // DeepSeek safety documentation: https://api-docs.deepseek.com/guides/safety/（Handle Refusals）。
+                // 其它 OpenAI 兼容端点保留原来的「只有空正文才是 Filtered」行为。
+                failure == null && (deepSeekApiEndpoint || !sawContent) &&
+                    (refusalSeen || finishReason == "content_filter") ->
                     LlmEvent.Failed(ApiError.Filtered(httpCode = 200))
                 failure != null -> LlmEvent.Failed(failure!!)
-                else -> LlmEvent.Finished(
-                    usage = usage,
-                    truncated = isTruncated(finishReason, sawDone),
-                    citations = citations.values.toList(),
-                    webSearchDropped = webSearchDropped,
-                )
+                else -> {
+                    val finalReasoningContent = if (serverToolCallsJson != null) {
+                        // 依据 https://api-docs.deepseek.com/guides/web_tools/：
+                        // 开启思考且无末步新推理时回传 ""，关闭思考的纯联网轮次不传 reasoning_content（返回 null）。
+                        if (sawReasoningSignal || fullReasoningBuffer.isNotEmpty()) {
+                            fullReasoningBuffer.substring(
+                                lastStepReasoningOffset.coerceAtMost(fullReasoningBuffer.length),
+                            )
+                        } else {
+                            null
+                        }
+                    } else {
+                        fullReasoningBuffer.toString().takeIf { it.isNotEmpty() }
+                    }
+                    LlmEvent.Finished(
+                        usage = usage,
+                        truncated = isTruncated(finishReason, sawDone),
+                        citations = citations.values.toList(),
+                        webSearchDropped = webSearchDropped,
+                        reasoningContent = finalReasoningContent,
+                        serverToolCallsJson = serverToolCallsJson,
+                    )
+                }
             }
         }
 
@@ -465,15 +533,19 @@ class LlmClient(
             ?: throw ApiException(ApiError.BadResponse(httpCode, errorSnippet(text)))
         val message = first["message"] as? JsonObject
         val content = message?.stringOrNull("content")
-        // 正文非空：正常返回（`finish_reason=content_filter` 但已有正文时与流式一致按正常收尾，
-        // 见 `LlmFilteredRefusalTest` 的流式对应用例）。
+        val terminalRefusal = !message?.stringOrNull("refusal").isNullOrEmpty() ||
+            first.stringOrNull("finish_reason") == "content_filter"
+        // DeepSeek 的非流式安全拒绝同样不得把正文前缀作为成功返回。
+        // DeepSeek safety documentation: https://api-docs.deepseek.com/guides/safety/（Chat Completions refusal）。
+        if (deepSeekApiEndpoint && terminalRefusal) {
+            throw ApiException(ApiError.Filtered(httpCode, raw = null))
+        }
+        // 其它兼容端点保留旧行为：正文非空优先；空正文 refusal/filter 才按 Filtered 处理。
         if (!content.isNullOrEmpty()) return content
         // v0.5.0 识图：服务商对图片的拒绝。上层按 Filtered 换人话。
         // v0.5.0 非流式也要认 `finish_reason=content_filter`
         // 且正文为空的形态（流式终态已映射，见 stream() 的 terminal 判定）。
-        if (!message?.stringOrNull("refusal").isNullOrEmpty() ||
-            first.stringOrNull("finish_reason") == "content_filter"
-        ) {
+        if (terminalRefusal) {
             throw ApiException(ApiError.Filtered(httpCode, raw = null))
         }
         // 空字符串正文保持旧行为（原样返回，由调用方按"没内容"处理），不改语义。
@@ -556,12 +628,42 @@ class LlmClient(
     }
 
     /**
+     * 解析 `choice.server_tool_event` 的 `call_started` / `call_completed` 负载
+     * （https://api-docs.deepseek.com/guides/web_tools/）。
+     */
+    private fun parseToolProgress(call: JsonObject?, eventType: String): LlmEvent.ToolProgress? {
+        if (call == null) return null
+        val kind = call.stringOrNull("kind")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: call.stringOrNull("type")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return null
+        val status = call.stringOrNull("status")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (eventType == "call_started") "in_progress" else "completed"
+        val action = call["action"] as? JsonObject
+        val queries = action?.get("queries")?.asArrayOrNull()
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { q -> q.isNotEmpty() } }
+            .orEmpty()
+        val url = action?.stringOrNull("url")?.trim()?.takeIf { it.isNotEmpty() }
+        val sourceCount = call["sources"]?.asArrayOrNull()?.size ?: 0
+        return LlmEvent.ToolProgress(
+            kind = kind,
+            status = status,
+            queries = queries,
+            url = url,
+            sourceCount = sourceCount,
+        )
+    }
+
+    /**
      * 解析联网搜索引用：`annotations[].url_citation`。
      *
-     * 只取 `type == "url_citation"` 且 url 非空的项；按 url 去重并保持首次出现顺序。
+     * 只取 `type == "url_citation"` 且 url 非空的项；按 `(url, startIndex, endIndex)` 去重并保持首次出现顺序，
+     * 保留同一来源在正文不同位置的角标跨度。
      * 未知类型 / 缺字段静默跳过（服务端扩展字段只会增不会减，不能因为多一种就整轮失败）。
      */
-    private fun parseCitations(element: JsonElement?, into: MutableMap<String, Citation>) {
+    private fun parseCitations(
+        element: JsonElement?,
+        into: MutableMap<Triple<String, Int?, Int?>, Citation>,
+    ) {
         val array = element?.asArrayOrNull() ?: return
         array.forEach { item ->
             val obj = item.asObjectOrNull() ?: return@forEach
@@ -570,7 +672,18 @@ class LlmClient(
             val url = citation.stringOrNull("url")?.trim().orEmpty()
             if (url.isEmpty()) return@forEach
             val title = citation.stringOrNull("title")?.trim()?.takeIf { it.isNotEmpty() }
-            into.putIfAbsent(url, Citation(url = url, title = title))
+            val startIndex = citation.intOrNull("start_index")?.takeIf { it >= 0 }
+            val endIndex = citation.intOrNull("end_index")?.takeIf { it >= 0 }
+            val key = Triple(url, startIndex, endIndex)
+            into.putIfAbsent(
+                key,
+                Citation(
+                    url = url,
+                    title = title,
+                    startIndex = startIndex,
+                    endIndex = endIndex,
+                ),
+            )
         }
     }
 
@@ -646,6 +759,9 @@ class LlmClient(
     }
 }
 
+/** 判断 JSON 对象是否显式包含非 null 键（用于区分思考关闭时的 `"reasoning_content": null`/缺省与空串 `""`）。 */
+private fun JsonObject.hasNonNull(key: String): Boolean = this[key]?.let { it !is JsonNull } == true
+
 /**
  * 这个 400 错误体是否像「带联网工具的请求不被接受」（降级的唯一触发条件）。
  *
@@ -670,5 +786,6 @@ private val WEB_SEARCH_REJECTION_HINTS = listOf(
     "server_tool_calls",
     "tool_calls",
     "web_search",
+    "read_url",
     "tools",
 )

@@ -98,6 +98,24 @@ class PromptDedupTest {
     }
 
     @Test
+    fun regenerationExcludesCurrentUserAndOldReplyByIdButKeepsEarlierHistory() {
+        val rows = listOf(
+            message("u0", MemMessage.ROLE_USER, "在吗", createdAt = 1_000L),
+            message("a0", MemMessage.ROLE_ASSISTANT, "在的", createdAt = 2_000L),
+            message("u1", MemMessage.ROLE_USER, currentText, createdAt = 3_000L),
+            message("a1", MemMessage.ROLE_ASSISTANT, "旧回复", createdAt = 4_000L),
+        )
+
+        val filtered = ChatEngine.historyRowsForPrompt(
+            rows,
+            excludeMessageId = "u1",
+            additionalExcludedMessageIds = setOf("a1"),
+        )
+
+        assertEquals(listOf("u0", "a0"), filtered.map { it.id })
+    }
+
+    @Test
     fun nullExcludeIdKeepsAllRowsInOriginalOrder() {
         val rows = rowsWithCurrentUserMessage()
 

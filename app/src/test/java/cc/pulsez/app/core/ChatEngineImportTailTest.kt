@@ -77,7 +77,7 @@ class ChatEngineImportTailTest {
     )
 
     @Test
-    fun findLatestImportSegmentMatchesOnlyWhenLastSealedBeforeOpenIsImport() {
+    fun findLatestContinuitySegmentMatchesImportAndBudgetBeforeOpen() {
         val segmentsAfterImport = listOf(
             seg("imp-1", 0, "SEALED", ChatEngine.IMPORT_REASON),
             seg("imp-2", 1, "SEALED", ChatEngine.IMPORT_REASON),
@@ -85,17 +85,26 @@ class ChatEngineImportTailTest {
         )
         assertEquals(
             "imp-2",
-            ChatEngine.findLatestImportSegmentBeforeOpen(segmentsAfterImport, "open-1")?.id,
+            ChatEngine.findLatestContinuitySegmentBeforeOpen(segmentsAfterImport, "open-1")?.id,
         )
 
         val segmentsAfterBatonSeal = listOf(
             seg("imp-1", 0, "SEALED", ChatEngine.IMPORT_REASON),
-            seg("sealed-budget", 1, "SEALED", "BUDGET"),
-            seg("open-2", 2, "OPEN", "BUDGET"),
+            seg("sealed-budget", 1, "SEALED", ChatEngine.BUDGET_REASON),
+            seg("open-2", 2, "OPEN", ChatEngine.BUDGET_REASON),
+        )
+        assertEquals(
+            "原生 BUDGET 封存后，新 OPEN 段也应衔接上一封存段尾部原文",
+            "sealed-budget",
+            ChatEngine.findLatestContinuitySegmentBeforeOpen(segmentsAfterBatonSeal, "open-2")?.id,
+        )
+
+        val unrelatedSegments = listOf(
+            seg("other-sealed", 0, "SEALED", "OTHER"),
+            seg("open-init", 1, "OPEN", "INIT"),
         )
         assertNull(
-            "正常交接封存过之后不再回头取旧导入段尾部",
-            ChatEngine.findLatestImportSegmentBeforeOpen(segmentsAfterBatonSeal, "open-2"),
+            ChatEngine.findLatestContinuitySegmentBeforeOpen(unrelatedSegments, "open-init"),
         )
     }
 

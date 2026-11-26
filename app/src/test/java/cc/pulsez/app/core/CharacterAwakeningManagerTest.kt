@@ -22,6 +22,8 @@ import cc.pulsez.app.importer.deepseek.ParsedDeepSeekSession
 import cc.pulsez.app.net.HttpFactory
 import cc.pulsez.app.net.LlmClient
 import java.io.File
+import java.net.InetAddress
+import java.net.UnknownHostException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +39,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.Dns
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -111,6 +115,27 @@ class CharacterAwakeningManagerTest {
             .setHeader("Content-Type", "text/event-stream")
             .setBody(body)
     }
+
+    private fun rawSseResponse(vararg frames: String): MockResponse = MockResponse()
+        .setHeader("Content-Type", "text/event-stream")
+        .setBody(buildString {
+            frames.forEach { append("data: ").append(it).append("\n\n") }
+            append("data: [DONE]\n\n")
+        })
+
+    private fun deepSeekMockClient(): LlmClient = LlmClient(
+        http = HttpFactory.create()
+            .newBuilder()
+            .dns(object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> {
+                    if (hostname != "api.deepseek.com") throw UnknownHostException(hostname)
+                    return listOf(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)))
+                }
+            })
+            .build(),
+        baseUrl = "http://api.deepseek.com:${server.port}/v1",
+        apiKey = "sk-test",
+    )
 
     private fun createManager(
         clientProvider: suspend () -> LlmClient? = {
@@ -409,5 +434,56 @@ class CharacterAwakeningManagerTest {
         val storeDir = File(tempFolder.root, "att").apply { mkdirs() }
         deletionRepo.deleteCharacters(listOf(ch.id), AttachmentStore(storeDir))
         assertNull(manager.currentEntry(ch.id))
+    }
+
+    @Test
+    fun `DeepSeek refusal after parsed whisper removes the refused prefix`() = runBlocking {
+        val (ch, thread) = characters.createWithThread("阿星", "")
+        chat.append(thread.id, thread.activeSegmentId!!, "user", "测试历史", 4)
+        settings.setChatBoundEndpoint(
+            "http://api.deepseek.com:${server.port}/v1",
+            "deepseek-chat",
+            "http://api.deepseek.com:${server.port}",
+        )
+        server.enqueue(
+            rawSseResponse(
+                """{"choices":[{"delta":{"content":"[[whisper]] 这条已解析的前缀不能被保留。\n"}}]}""",
+                """{"choices":[{"delta":{"reasoning_content":"拒绝前的思考"}}]}""",
+                """{"choices":[{"delta":{"content":"余下前缀"},"finish_reason":"content_filter"}]}""",
+            ),
+        )
+
+        val manager = createManager(clientProvider = { deepSeekMockClient() })
+        manager.enqueueBatch("b-refusal", listOf(ch.id))
+        val failed = withTimeout(5_000) {
+            manager.observeCharacter(ch.id).first { it?.status == AwakeningStatus.FAILED }
+        }!!
+
+        assertTrue("终态拒绝前已解析的 whisper 必须撤下", failed.whispers.isEmpty())
+    }
+
+    @Test
+    fun `DeepSeek disconnect after parsed whisper keeps existing partial failure semantics`() = runBlocking {
+        val (ch, thread) = characters.createWithThread("阿星", "")
+        chat.append(thread.id, thread.activeSegmentId!!, "user", "测试历史", 4)
+        settings.setChatBoundEndpoint(
+            "http://api.deepseek.com:${server.port}/v1",
+            "deepseek-chat",
+            "http://api.deepseek.com:${server.port}",
+        )
+        val firstFrame = """{"choices":[{"delta":{"content":"[[whisper]] 断流前已经显示的信号。\n"}}]}"""
+        val secondFrame = """{"choices":[{"delta":{"content":"${"x".repeat(512)}"}}]}"""
+        server.enqueue(
+            rawSseResponse(firstFrame, secondFrame)
+                .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY),
+        )
+
+        val manager = createManager(clientProvider = { deepSeekMockClient() })
+        manager.enqueueBatch("b-disconnect", listOf(ch.id))
+        val failed = withTimeout(5_000) {
+            manager.observeCharacter(ch.id).first { it?.status == AwakeningStatus.FAILED }
+        }!!
+
+        assertEquals("只有终态内容拒绝才撤回，普通断流继续保留原有部分结果", listOf("断流前已经显示的信号。"), failed.whispers)
     }
 }

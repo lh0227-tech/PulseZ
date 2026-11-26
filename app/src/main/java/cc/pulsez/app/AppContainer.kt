@@ -13,6 +13,9 @@ import cc.pulsez.app.data.db.PulsezDatabase
 import cc.pulsez.app.data.repo.CharacterRepository
 import cc.pulsez.app.data.repo.ChatRepository
 import cc.pulsez.app.data.repo.ImportRepository
+import cc.pulsez.app.data.repo.RemoteFileCleanupRepository
+import cc.pulsez.app.data.repo.RemoteFileCleanupCoordinator
+import cc.pulsez.app.data.repo.RemoteFileDeleteGateway
 import cc.pulsez.app.data.settings.ImportPrefs
 import cc.pulsez.app.data.settings.Settings
 import cc.pulsez.app.data.settings.SettingsStore
@@ -21,6 +24,7 @@ import cc.pulsez.app.net.ChatMessage
 import cc.pulsez.app.net.ChatRequest
 import cc.pulsez.app.net.BaseUrl
 import cc.pulsez.app.net.EmbeddingClient
+import cc.pulsez.app.net.FilesClient
 import cc.pulsez.app.net.HttpFactory
 import cc.pulsez.app.net.LlmClient
 import cc.pulsez.app.net.Usage
@@ -38,11 +42,13 @@ import cc.pulsez.app.ui.config.needsLegacyKeyReset
 import cc.pulsez.app.ui.config.resolveBinding
 import cc.pulsez.app.ui.importer.ImportTaskStore
 import cc.pulsez.app.util.SecretStore
+import cc.pulsez.app.util.RemoteFileCredentialBinding
 import cc.pulsez.app.wire.Pricing
 import cc.pulsez.app.wire.ProbeTester
 import java.io.File
 import java.security.MessageDigest
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -101,6 +107,27 @@ class AppContainer(
     val settings: SettingsStore by lazy { SettingsStore(appContext) }
 
     val secrets: SecretStore by lazy { SecretStore(appContext) }
+
+    /** Remote cleanup rows survive the app's own clearAllTables wipe because they are a raw SQLite table. */
+    val remoteFileCleanup: RemoteFileCleanupRepository by lazy { RemoteFileCleanupRepository(database) }
+
+    /** One app-process worker; it only constructs a Files client after a bound DeepSeek session has candidates. */
+    internal val remoteFileCleanupCoordinator: RemoteFileCleanupCoordinator by lazy {
+        RemoteFileCleanupCoordinator(
+            scope = appScope,
+            resolveSession = { resolvedChatEndpoint() },
+            pendingFor = { bindingId -> remoteFileCleanup.pendingFor(bindingId) },
+            markDeleted = { fileId, bindingId -> remoteFileCleanup.markDeleted(fileId, bindingId) },
+            createGateway = { session ->
+                val client = FilesClient(http = http, baseUrl = session.baseUrl, apiKey = session.apiKey)
+                RemoteFileDeleteGateway { fileId -> client.deleteFile(fileId) }
+            },
+        )
+    }
+
+    private val remoteFileCredentialBinding: RemoteFileCredentialBinding by lazy {
+        RemoteFileCredentialBinding()
+    }
 
     // ---------------------------------------------------------------- v0.5.2 密钥缝
 
@@ -255,7 +282,7 @@ class AppContainer(
         model: String,
         keyInput: String,
     ): CredentialSaveResult = withContext(Dispatchers.IO) {
-        credentialMutex.withLock {
+        val result = credentialMutex.withLock {
             val before = runCatching { settings.flow.first() }.getOrNull()
             val result = credentialWorkflow.save(chatCredentialSlot, baseUrl, model, keyInput)
             if (result != CredentialSaveResult.SAVED) {
@@ -266,6 +293,12 @@ class AppContainer(
             }
             result
         }
+        if (result == CredentialSaveResult.SAVED) {
+            // Re-entering the exact saved credential can safely retry only its matching tombstones.
+            // The trigger is outside credentialMutex; the coordinator resolves and pins its own session.
+            remoteFileCleanupCoordinator.requestRetry()
+        }
+        result
     }
 
     /** 保存找旧事三格（同协议）。 */
@@ -450,6 +483,12 @@ class AppContainer(
     /** 后台维护（增量抽取 / 交接）用应用级作用域，切页锁屏都不中断。 */
     val appScope: CoroutineScope by lazy {
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    }
+
+    init {
+        // Scan durable leftovers after container construction without delaying startup.
+        // Missing credentials resolve to null, so this startup signal cannot send a request by itself.
+        appScope.launch { remoteFileCleanupCoordinator.requestRetry() }
     }
 
     // ---------------------------------------------------------------- v0.5.4 清空代际
@@ -873,6 +912,55 @@ class AppContainer(
 
     /** 本次进程内是否已收起过 AI 标识（收起后不可移除，只能折叠）。 */
     var aiBadgeDismissed: Boolean = false
+
+    /**
+     * 聊天端点一次性快照（供文件上传等客户端复用凭证守卫，不泄漏密钥）。
+     * 刻意不是 data class，显式遮罩 [toString] 中的 [apiKey]。
+     */
+    class ChatEndpointSession(
+        val baseUrl: String,
+        val apiKey: String,
+        /** Local HMAC binding only; null means unverifiable and must never authorize reuse/delete. */
+        val remoteCredentialBindingId: String? = null,
+        /** Immutable settings read under the same credential lock; null preserves synthetic caller compatibility. */
+        val settingsSnapshot: Settings? = null,
+    ) {
+        override fun toString(): String = "ChatEndpointSession(baseUrl=$baseUrl, apiKey=***)"
+    }
+
+    /**
+     * 取当前已绑定且可用的聊天端点会话；未配置 / 绑定不成立 / 无密文返回 null。
+     */
+    suspend fun resolvedChatEndpoint(): ChatEndpointSession? = withContext(Dispatchers.IO) {
+        withCredentialReadLock<ChatEndpointSession?> { current ->
+            if (current.chatBaseUrl.isBlank() || current.chatModel.isBlank()) {
+                return@withCredentialReadLock null
+            }
+            val key = usableKey(
+                hasKey = current.hasChatKey,
+                keyHost = current.chatKeyHost,
+                baseUrl = current.chatBaseUrl,
+                secretName = cc.pulsez.app.ui.config.ConfigViewModel.SECRET_CHAT_KEY,
+            ) ?: return@withCredentialReadLock null
+            val remoteCredentialBindingId = try {
+                remoteFileCredentialBinding.identifier(
+                    baseUrl = current.chatBaseUrl,
+                    apiKey = key,
+                    hasKnownRecords = remoteFileCleanup.hasKnownBindingRecords(),
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            ChatEndpointSession(
+                baseUrl = current.chatBaseUrl,
+                apiKey = key,
+                remoteCredentialBindingId = remoteCredentialBindingId,
+                settingsSnapshot = current,
+            )
+        }
+    }
 
     /**
      * 聊天客户端：配置齐全 + 密钥绑定成立才返回；否则 null，由 UI 引导去配置。

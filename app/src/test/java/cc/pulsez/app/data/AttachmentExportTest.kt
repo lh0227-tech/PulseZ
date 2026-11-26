@@ -83,7 +83,7 @@ class AttachmentExportTest {
         seedCharacterThreadAndMessage(db)
         val now = 1_700_000_000_000L
 
-        // 未软删、带 localPath 与 remoteFileId（后两者都不能出现在导出 JSON 里）
+        // 未软删、带 localPath、remoteFileId 与本机 binding（后三者都不能出现在导出 JSON 里）
         db.attachmentDao().upsert(
             AttachmentEntity(
                 id = "att-export",
@@ -102,6 +102,7 @@ class AttachmentExportTest {
                 expiresAt = now + 86_400_000L,
                 deletedAt = null,
                 createdAt = now,
+                remoteCredentialBindingId = "local-hmac-test-marker",
             ),
         )
         // 已软删：不应导出
@@ -177,8 +178,10 @@ class AttachmentExportTest {
         // 隐私硬断言：路径与服务商句柄连值都不能出现；草稿也不该出现。
         assertFalse("不能导出 localPath", json.contains("secret-local-path"))
         assertFalse("不能导出 remoteFileId", json.contains("remote-file-handle-xyz"))
+        assertFalse("不能导出本机凭据绑定标识", json.contains("local-hmac-test-marker"))
         assertFalse("不能出现错误码字段以外的内部列名", json.contains("localPath"))
         assertFalse(json.contains("remoteFileId"))
+        assertFalse(json.contains("remoteCredentialBindingId"))
         assertFalse("草稿未绑定消息，不导出", json.contains("草稿.jpg"))
     }
 

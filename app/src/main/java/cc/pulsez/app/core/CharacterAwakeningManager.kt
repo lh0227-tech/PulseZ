@@ -7,12 +7,14 @@ import cc.pulsez.app.data.repo.ChatRepository
 import cc.pulsez.app.data.repo.MemoryRepository
 import cc.pulsez.app.data.settings.SettingsStore
 import cc.pulsez.app.mem.TokenEstimator
+import cc.pulsez.app.net.ApiError
 import cc.pulsez.app.net.ChatMessage
 import cc.pulsez.app.net.ChatRequest
 import cc.pulsez.app.net.LlmClient
 import cc.pulsez.app.net.LlmEvent
 import cc.pulsez.app.net.Usage
 import cc.pulsez.app.net.asInternalRequest
+import cc.pulsez.app.net.isDeepSeekEndpoint
 import java.io.File
 import java.util.TreeSet
 import kotlinx.coroutines.CancellationException
@@ -612,8 +614,10 @@ class CharacterAwakeningManager(
 
             val parser = AwakeningStreamParser()
             var terminalError: String? = null
+            var clearRefusedWhispers = false
             var finished = false
             var latestUsage: Usage? = null
+            val deepSeekEndpoint = isDeepSeekEndpoint(currentSettings.chatBaseUrl)
 
             withTimeout(timeoutMs) {
                 client.stream(request).collect { event ->
@@ -628,6 +632,7 @@ class CharacterAwakeningManager(
                             }
                         }
                         is LlmEvent.Reasoning -> Unit
+                        is LlmEvent.ToolProgress -> Unit
                         is LlmEvent.Finished -> {
                             finished = true
                             latestUsage = event.usage
@@ -638,6 +643,10 @@ class CharacterAwakeningManager(
                         }
                         is LlmEvent.Failed -> {
                             terminalError = FAILURE_COPY
+                            // DeepSeek safety docs: https://api-docs.deepseek.com/guides/safety/；审核在输出完成后，
+                            // 终态拒绝时撤掉本轮已增量解析的 whispers，普通断流/取消沿用旧语义。
+                            clearRefusedWhispers = deepSeekEndpoint &&
+                                event.error.kind == ApiError.Kind.FILTERED
                         }
                     }
                 }
@@ -646,7 +655,11 @@ class CharacterAwakeningManager(
             if (wipeEpochFlow != null && wipeEpochFlow.value != runWipeEpoch) return
 
             if (!finished || terminalError != null) {
-                markFailed(characterId, terminalError ?: FAILURE_COPY)
+                markFailed(
+                    characterId,
+                    terminalError ?: FAILURE_COPY,
+                    clearWhispers = clearRefusedWhispers,
+                )
                 return
             }
 
@@ -714,7 +727,11 @@ class CharacterAwakeningManager(
         }
     }
 
-    private suspend fun markFailed(characterId: String, message: String) {
+    private suspend fun markFailed(
+        characterId: String,
+        message: String,
+        clearWhispers: Boolean = false,
+    ) {
         mutex.withLock {
             val current = _entries.value[characterId] ?: return@withLock
             if (current.status == AwakeningStatus.COMPLETED) return@withLock
@@ -722,6 +739,7 @@ class CharacterAwakeningManager(
             updated[characterId] = current.copy(
                 status = AwakeningStatus.FAILED,
                 errorMessage = message,
+                whispers = if (clearWhispers) emptyList() else current.whispers,
                 updatedAt = nowProvider(),
             )
             publishAndPersistLocked(updated)

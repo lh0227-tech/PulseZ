@@ -20,6 +20,12 @@ sealed interface ContentPart {
      * ` （透明铺白、动图只取第一帧）。
      */
     data class Image(val base64Jpeg: String) : ContentPart
+
+    /**
+     * DeepSeek 文件上传后拿到的文件引用（`{"type":"file","file_id":"..."}`）。
+     * DeepSeek API docs: `https://api-docs.deepseek.com/`（Files API / document_parsing）。
+     */
+    data class File(val fileId: String, val fileName: String? = null) : ContentPart
 }
 
 /**
@@ -36,6 +42,8 @@ data class ChatMessage(
     val role: String,
     val content: String,
     val parts: List<ContentPart> = emptyList(),
+    val reasoningContent: String? = null,
+    val serverToolCallsJson: String? = null,
 )
 
 /**
@@ -46,6 +54,8 @@ data class ChatMessage(
 data class Citation(
     val url: String,
     val title: String? = null,
+    val startIndex: Int? = null,
+    val endIndex: Int? = null,
 )
 
 /**
@@ -77,6 +87,7 @@ data class ChatRequest(
     val thinking: Boolean? = null,
     val reasoningEffort: String = "low",
     val webSearch: Boolean = false,
+    val readUrl: Boolean = false,
 )
 
 /**
@@ -106,6 +117,13 @@ data class Usage(
 sealed interface LlmEvent {
     data class Delta(val text: String) : LlmEvent
     data class Reasoning(val text: String) : LlmEvent
+    data class ToolProgress(
+        val kind: String,
+        val status: String,
+        val queries: List<String> = emptyList(),
+        val url: String? = null,
+        val sourceCount: Int = 0,
+    ) : LlmEvent
     data class Finished(
         val usage: Usage?,
         val truncated: Boolean,
@@ -116,6 +134,8 @@ sealed interface LlmEvent {
          * 依据（带 tools 时历史必须回传 reasoning_content，否则 400）、§3.4、§5.3。
          */
         val webSearchDropped: Boolean = false,
+        val reasoningContent: String? = null,
+        val serverToolCallsJson: String? = null,
     ) : LlmEvent
 
     data class Failed(val error: ApiError) : LlmEvent

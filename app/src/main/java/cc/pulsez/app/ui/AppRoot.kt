@@ -924,6 +924,7 @@ fun AppRoot(
                         // v0.5 识图门禁：端点/模型/能力缓存任一变化 → 重算入口三态。
                         // 非 DeepSeek 端点隐藏入口；DeepSeek 但模型看不了图 → 置灰 + 说明。
                         val imageEntry = current.imageEntryState()
+                        val deepSeekEndpoint = current.isDeepSeekProvider()
                         LaunchedEffect(
                             current.chatBaseUrl,
                             current.chatModel,
@@ -933,6 +934,7 @@ fun AppRoot(
                             vm.syncImageGate(
                                 visible = imageEntry != ImageEntryState.HIDDEN_OTHER_PROVIDER,
                                 enabled = imageEntry == ImageEntryState.ENABLED,
+                                fileEnabled = deepSeekEndpoint,
                             )
                         }
                         // v0.5.1 语音门禁 + v0.5.2 接 AppContainer 的统一运行守卫——
@@ -1056,6 +1058,16 @@ fun AppRoot(
                             voice = state.voice,
                             voiceActions = voiceActions,
                             voicePermissionResult = voicePermissionResult,
+                            // v0.6.10 消息操作（长按复制 / 重新生成 / 重试 / 删除）与 DeepSeek 文件上传
+                            fileInputEnabled = state.fileInputEnabled,
+                            fileDrafts = state.fileDrafts,
+                            uploadingFiles = state.uploadingFiles,
+                            onFilePicked = { uri -> vm.onFilePicked(uri, context.contentResolver) },
+                            onRemoveFileDraft = vm::removeFileDraft,
+                            onRegenerateMessage = vm::regenerateMessage,
+                            onRetryMessage = vm::retryMessage,
+                            onDeleteMessage = vm::deleteMessage,
+                            onShowNotice = vm::showNotice,
                         )
                     }
 

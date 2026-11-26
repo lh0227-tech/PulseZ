@@ -1,5 +1,7 @@
 package cc.pulsez.app.data.repo
 
+import androidx.room.withTransaction
+import cc.pulsez.app.data.db.AttachmentKind
 import cc.pulsez.app.data.db.CharacterEntity
 import cc.pulsez.app.data.db.MessageEntity
 import cc.pulsez.app.data.db.MessageWithSegmentOrdinal
@@ -9,7 +11,6 @@ import cc.pulsez.app.data.db.ThreadEntity
 import cc.pulsez.app.data.db.ThreadKind
 import cc.pulsez.app.data.db.ThreadMemberEntity
 import cc.pulsez.app.util.Ids
-import androidx.room.withTransaction
 
 /**
  * 角色仓库。字段语义见 。
@@ -75,6 +76,21 @@ class CharacterRepository(private val db: PulsezDatabase) {
  */
 class ChatRepository(private val db: PulsezDatabase) {
 
+    private val remoteFileCleanup = RemoteFileCleanupRepository(db)
+
+    data class MessagePropagationDelete(
+        val deleted: Boolean,
+        val localPaths: List<String> = emptyList(),
+        val remoteFileIds: List<String> = emptyList(),
+    )
+
+    data class AssistantReplyReplacement(
+        val message: MessageEntity,
+        val deleted: MessagePropagationDelete,
+    )
+
+    private class OperationInvalidatedException : RuntimeException()
+
     suspend fun ensureThread(characterId: String, now: Long = System.currentTimeMillis()): ThreadEntity =
         db.withTransaction {
             db.threadDao().latestForCharacter(characterId)?.let { return@withTransaction it }
@@ -111,6 +127,64 @@ class ChatRepository(private val db: PulsezDatabase) {
             )
             thread
         }
+
+    /**
+     * Loading-only variant that will not create a thread after its captured wipe generation expires.
+     * Room grants one transaction at a time; if wipe begins after the final in-transaction gate,
+     * its queued clear removes this transaction's rows before the loader can publish them.
+     * Room documentation: https://developer.android.com/reference/kotlin/androidx/room/RoomDatabase.html
+     */
+    suspend fun ensureThreadForLoad(
+        characterId: String,
+        canContinue: () -> Boolean,
+        now: Long = System.currentTimeMillis(),
+    ): ThreadEntity? {
+        if (characterId.isBlank()) return null
+        return try {
+            db.withTransaction {
+                if (!canContinue()) return@withTransaction null
+                db.threadDao().latestForCharacter(characterId)?.let { existing ->
+                    return@withTransaction existing.takeIf { canContinue() }
+                }
+                val threadId = Ids.new()
+                val segmentId = Ids.new()
+                val thread = ThreadEntity(
+                    id = threadId,
+                    characterId = characterId,
+                    title = null,
+                    createdAt = now,
+                    lastMessageAt = now,
+                    activeSegmentId = segmentId,
+                    segmentOrdinal = 0,
+                    totalMessages = 0,
+                    totalTokens = 0,
+                    archived = false,
+                    kind = ThreadKind.SINGLE,
+                )
+                db.threadDao().upsert(thread)
+                if (!canContinue()) throw OperationInvalidatedException()
+                db.segmentDao().upsert(
+                    SegmentEntity(
+                        id = segmentId,
+                        threadId = threadId,
+                        ordinal = 0,
+                        summary = null,
+                        styleNotes = null,
+                        firstMessageAt = now,
+                        lastMessageAt = now,
+                        tokenSum = 0,
+                        state = "OPEN",
+                        batonReason = null,
+                        createdAt = now,
+                    ),
+                )
+                if (!canContinue()) throw OperationInvalidatedException()
+                thread
+            }
+        } catch (_: OperationInvalidatedException) {
+            null
+        }
+    }
 
     /**
      * 建一个群聊 thread。
@@ -503,23 +577,27 @@ class ChatRepository(private val db: PulsezDatabase) {
         speakerCharacterId: String? = null,
         /** Only the live chat input path opts in; imports and assistant/group writes keep the default. */
         recordSingleChatActivity: Boolean = false,
+        reasoningContent: String? = null,
+        serverToolCallsJson: String? = null,
+        citationsJson: String? = null,
+        latestReminder: String? = null,
     ): MessageEntity {
-        val message = MessageEntity(
-            id = Ids.new(),
+        val message = newMessage(
             threadId = threadId,
             segmentId = segmentId,
             role = role,
-            content = text,
+            text = text,
             tokens = tokens,
-            emotion = emotion,
             status = status,
-            draft = null,
+            emotion = emotion,
             usageIn = usageIn,
             usageOut = usageOut,
-            previousContent = null,
             createdAt = createdAt,
-            deletedAt = null,
             speakerCharacterId = speakerCharacterId,
+            reasoningContent = reasoningContent,
+            serverToolCallsJson = serverToolCallsJson,
+            citationsJson = citationsJson,
+            latestReminder = latestReminder,
         )
         return db.withTransaction {
             db.messageDao().upsert(message)
@@ -532,6 +610,319 @@ class ChatRepository(private val db: PulsezDatabase) {
             }
             message
         }
+    }
+
+    /**
+     * Append the user row for an accepted live send only while that send still owns the turn.
+     * The captured wipe epoch and stop fence are checked after Room grants the transaction slot
+     * and after each mutation, so a rejected send cannot leave a row, activity count, or thread
+     * touch behind. Imports and other append callers retain [append]'s existing semantics.
+     * Room documentation: https://developer.android.com/reference/kotlin/androidx/room/RoomDatabase.html
+     */
+    suspend fun appendUserForTurn(
+        threadId: String,
+        segmentId: String,
+        text: String,
+        tokens: Int,
+        createdAt: Long = System.currentTimeMillis(),
+        latestReminder: String? = null,
+        canBeginCommit: () -> Boolean,
+        canContinue: () -> Boolean,
+    ): MessageEntity? {
+        if (threadId.isBlank() || segmentId.isBlank()) return null
+        val message = newMessage(
+            threadId = threadId,
+            segmentId = segmentId,
+            role = "user",
+            text = text,
+            tokens = tokens,
+            createdAt = createdAt,
+            latestReminder = latestReminder,
+        )
+        return try {
+            db.withTransaction {
+                if (!canBeginCommit()) return@withTransaction null
+                db.messageDao().upsert(message)
+                if (!canContinue()) throw OperationInvalidatedException()
+                db.threadDao().touch(threadId, createdAt)
+                if (!canContinue()) throw OperationInvalidatedException()
+                // A send that fails after this transaction still counts as real activity.
+                db.threadDao().recordSingleChatActivity(threadId, System.currentTimeMillis())
+                if (!canContinue()) throw OperationInvalidatedException()
+                message
+            }
+        } catch (_: OperationInvalidatedException) {
+            null
+        }
+    }
+
+    /**
+     * Append a live assistant reply only while its sending turn is still current. The captured
+     * wipe epoch is checked after acquiring Room's transaction slot and after each mutation;
+     * invalidation after the first write throws so SQLite rolls the whole append back.
+     * Room documentation: https://developer.android.com/reference/kotlin/androidx/room/RoomDatabase.html
+     */
+    suspend fun appendAssistantForTurn(
+        threadId: String,
+        segmentId: String,
+        text: String,
+        tokens: Int,
+        emotion: String? = null,
+        usageIn: Int? = null,
+        usageOut: Int? = null,
+        createdAt: Long = System.currentTimeMillis(),
+        reasoningContent: String? = null,
+        serverToolCallsJson: String? = null,
+        citationsJson: String? = null,
+        canBeginCommit: () -> Boolean,
+        canContinue: () -> Boolean,
+    ): MessageEntity? {
+        if (threadId.isBlank() || segmentId.isBlank()) return null
+        val message = newMessage(
+            threadId = threadId,
+            segmentId = segmentId,
+            role = "assistant",
+            text = text,
+            tokens = tokens,
+            emotion = emotion,
+            usageIn = usageIn,
+            usageOut = usageOut,
+            createdAt = createdAt,
+            reasoningContent = reasoningContent,
+            serverToolCallsJson = serverToolCallsJson,
+            citationsJson = citationsJson,
+        )
+        return try {
+            db.withTransaction {
+                if (!canBeginCommit()) return@withTransaction null
+                db.messageDao().upsert(message)
+                if (!canContinue()) throw OperationInvalidatedException()
+                db.threadDao().touch(threadId, createdAt)
+                if (!canContinue()) throw OperationInvalidatedException()
+                message
+            }
+        } catch (_: OperationInvalidatedException) {
+            null
+        }
+    }
+
+    /**
+     * Replace a persisted assistant reply only after a new response is ready. The old row and all
+     * derived rows are soft-deleted in the same SQLite transaction that inserts the replacement.
+     * The action fence is entered only after Room has granted this transaction; each mutation
+     * checks the captured wipe epoch so invalidation throws and rolls back before commit. Room
+     * queues transactions one at a time, so a clear that starts after the final check runs after
+     * this transaction and removes its rows.
+     * Room documentation: https://developer.android.com/reference/kotlin/androidx/room/RoomDatabase?hl=en
+     * 异常或取消会回滚；替换失败时保留原回复。
+     */
+    suspend fun replaceAssistantReplyWithPropagation(
+        threadId: String,
+        segmentId: String,
+        oldMessageId: String,
+        text: String,
+        tokens: Int,
+        emotion: String? = null,
+        usageIn: Int? = null,
+        usageOut: Int? = null,
+        reasoningContent: String? = null,
+        serverToolCallsJson: String? = null,
+        citationsJson: String? = null,
+        createdAt: Long = System.currentTimeMillis(),
+        canBeginCommit: () -> Boolean = { true },
+        canContinue: () -> Boolean = { true },
+    ): AssistantReplyReplacement? {
+        if (threadId.isBlank() || segmentId.isBlank() || oldMessageId.isBlank()) return null
+        return try {
+            db.withTransaction {
+                val old = db.messageDao().byId(oldMessageId)?.takeIf {
+                    it.threadId == threadId && it.role == "assistant" && it.deletedAt == null
+                } ?: return@withTransaction null
+                if (!canBeginCommit()) return@withTransaction null
+                val deleted = softDeleteMessageWithPropagationInTransaction(
+                    threadId = threadId,
+                    messageId = old.id,
+                    at = createdAt,
+                    canContinue = canContinue,
+                )
+                if (!deleted.deleted) return@withTransaction null
+                if (!canContinue()) throw OperationInvalidatedException()
+                val replacement = newMessage(
+                    threadId = threadId,
+                    segmentId = segmentId,
+                    role = "assistant",
+                    text = text,
+                    tokens = tokens,
+                    emotion = emotion,
+                    usageIn = usageIn,
+                    usageOut = usageOut,
+                    createdAt = createdAt,
+                    reasoningContent = reasoningContent,
+                    serverToolCallsJson = serverToolCallsJson,
+                    citationsJson = citationsJson,
+                )
+                db.messageDao().upsert(replacement)
+                if (!canContinue()) throw OperationInvalidatedException()
+                db.threadDao().touch(threadId, createdAt)
+                if (!canContinue()) throw OperationInvalidatedException()
+                AssistantReplyReplacement(replacement, deleted)
+            }
+        } catch (_: OperationInvalidatedException) {
+            null
+        }
+    }
+
+    private fun newMessage(
+        threadId: String,
+        segmentId: String,
+        role: String,
+        text: String,
+        tokens: Int,
+        status: String = "OK",
+        emotion: String? = null,
+        usageIn: Int? = null,
+        usageOut: Int? = null,
+        createdAt: Long,
+        speakerCharacterId: String? = null,
+        reasoningContent: String? = null,
+        serverToolCallsJson: String? = null,
+        citationsJson: String? = null,
+        latestReminder: String? = null,
+    ) = MessageEntity(
+        id = Ids.new(),
+        threadId = threadId,
+        segmentId = segmentId,
+        role = role,
+        content = text,
+        tokens = tokens,
+        emotion = emotion,
+        status = status,
+        draft = null,
+        usageIn = usageIn,
+        usageOut = usageOut,
+        previousContent = null,
+        createdAt = createdAt,
+        deletedAt = null,
+        speakerCharacterId = speakerCharacterId,
+        reasoningContent = reasoningContent,
+        serverToolCallsJson = serverToolCallsJson,
+        citationsJson = citationsJson,
+        latestReminder = latestReminder,
+    )
+
+    /**
+     * 原地更新已有助手回复（修订/重试用）；只推进 `lastMessageAt`，不虚增 `totalMessages`。
+     */
+    suspend fun updateAssistantReply(
+        threadId: String,
+        messageId: String,
+        text: String,
+        tokens: Int,
+        status: String = "OK",
+        emotion: String? = null,
+        usageIn: Int? = null,
+        usageOut: Int? = null,
+        reasoningContent: String? = null,
+        serverToolCallsJson: String? = null,
+        citationsJson: String? = null,
+    ): Boolean {
+        if (threadId.isBlank() || messageId.isBlank()) return false
+        return db.withTransaction {
+            val updated = db.messageDao().updateReply(
+                id = messageId,
+                content = text,
+                tokens = tokens,
+                emotion = emotion,
+                status = status,
+                usageIn = usageIn,
+                usageOut = usageOut,
+                reasoningContent = reasoningContent,
+                serverToolCallsJson = serverToolCallsJson,
+                citationsJson = citationsJson,
+            )
+            if (updated == 0) return@withTransaction false
+            db.threadDao().touchTime(threadId, System.currentTimeMillis())
+            true
+        }
+    }
+
+    /**
+     * 单条消息软删并同一事务传播到派生数据：`chunk`、`chunk_term`、`memory_item`、`attachment`。
+     * 返回被软删附件的 `localPath` 列表供调用方在事务外删文件。
+     */
+    suspend fun softDeleteMessageWithPropagation(
+        threadId: String,
+        messageId: String,
+        at: Long = System.currentTimeMillis(),
+        canBeginCommit: () -> Boolean = { true },
+        canContinue: () -> Boolean = { true },
+    ): MessagePropagationDelete {
+        if (threadId.isBlank() || messageId.isBlank()) return MessagePropagationDelete(deleted = false)
+        return try {
+            db.withTransaction {
+                val target = db.messageDao().byId(messageId)?.takeIf {
+                    it.threadId == threadId && it.deletedAt == null
+                } ?: return@withTransaction MessagePropagationDelete(deleted = false)
+                if (!canBeginCommit()) return@withTransaction MessagePropagationDelete(deleted = false)
+                softDeleteMessageWithPropagationInTransaction(
+                    threadId = threadId,
+                    messageId = target.id,
+                    at = at,
+                    canContinue = canContinue,
+                )
+            }
+        } catch (_: OperationInvalidatedException) {
+            MessagePropagationDelete(deleted = false)
+        }
+    }
+
+    private suspend fun softDeleteMessageWithPropagationInTransaction(
+        threadId: String,
+        messageId: String,
+        at: Long,
+        canContinue: () -> Boolean,
+    ): MessagePropagationDelete {
+        val deleted = db.messageDao().softDeleteById(messageId, at)
+        if (deleted == 0) return MessagePropagationDelete(deleted = false)
+        if (!canContinue()) throw OperationInvalidatedException()
+        val chunkIds = db.chunkDao().idsMatchingMessage(threadId, messageId)
+        if (chunkIds.isNotEmpty()) {
+            db.chunkDao().invalidateByMessage(threadId, messageId, at)
+            if (!canContinue()) throw OperationInvalidatedException()
+            chunkIds.chunked(500).forEach { batch ->
+                db.chunkDao().deleteTerms(batch)
+                if (!canContinue()) throw OperationInvalidatedException()
+            }
+        }
+        db.memoryDao().markUnverifiedBySource(threadId, messageId)
+        if (!canContinue()) throw OperationInvalidatedException()
+        val attachments = db.attachmentDao().byMessageId(messageId)
+        if (attachments.isNotEmpty()) {
+            val softDeletedAttachments = db.attachmentDao().softDeleteByMessageId(messageId, at)
+            if (softDeletedAttachments > 0) {
+                // Tombstones are committed/rolled back with the message, derived data, and attachment rows.
+                // Replacement failures therefore cannot queue deletion of a file that is still referenced.
+                // The cleanup queue is written in the same transaction; Files API IDs are scoped to an account:
+                // https://api-docs.deepseek.com/guides/files_api/
+                attachments.asSequence()
+                    .filter { it.kind == AttachmentKind.FILE }
+                    .forEach { attachment ->
+                        remoteFileCleanup.enqueueInCurrentTransaction(
+                            attachment.remoteFileId,
+                            attachment.remoteCredentialBindingId,
+                        )
+                    }
+            }
+            if (!canContinue()) throw OperationInvalidatedException()
+        }
+        return MessagePropagationDelete(
+            deleted = true,
+            localPaths = attachments.map { it.localPath },
+            remoteFileIds = attachments.asSequence()
+                .filter { it.kind == AttachmentKind.FILE }
+                .mapNotNull { it.remoteFileId?.takeIf(String::isNotBlank) }
+                .toList(),
+        )
     }
 
     /**

@@ -152,6 +152,34 @@ class GroupReplyCallTest {
     }
 
     @Test
+    fun deepSeekFilteredTerminalAfterPartialPrefixThrowsInsteadOfReturningAGroupReply() = runBlocking {
+        val recorded = mutableListOf<Usage>()
+        val call = GroupReplyCall(
+            model = "deepseek-flash",
+            stream = {
+                flow {
+                    emit(LlmEvent.Delta("[[whisper]] 这段前缀不能成为群聊回复"))
+                    emit(LlmEvent.Reasoning("这段思考也不能变成成功结果"))
+                    emit(LlmEvent.Failed(ApiError.Filtered(httpCode = 200)))
+                }
+            },
+            recordUsage = { recorded += it },
+            internalBaseUrl = "https://api.deepseek.com/v1",
+        )
+
+        try {
+            call.invoke(prompt, 256)
+            fail("DeepSeek 终态拒绝不能把拒绝前缀作为群聊成功回复返回")
+        } catch (e: ApiException) {
+            assertEquals(ApiError.Kind.FILTERED, e.error.kind)
+        }
+
+        // 延续“已经出字就估算记账”的原语义；GroupReplyCall 的结果没有返回给记忆/群聊引擎。
+        assertEquals(1, recorded.size)
+        assertTrue(recorded.single().completionTokens > 0)
+    }
+
+    @Test
     fun failureBeforeAnyOutputDoesNotRecordFakeCharge() = runBlocking {
         val recorded = mutableListOf<Usage>()
         val call = GroupReplyCall(

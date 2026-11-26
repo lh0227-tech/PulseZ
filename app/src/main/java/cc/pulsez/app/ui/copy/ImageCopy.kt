@@ -151,6 +151,9 @@ internal object ImageCopy {
      */
     const val CONTENT_FILTER = "这张图服务商不收。换个方式说说，或者换一张？"
 
+    /** DeepSeek 终态拒绝可能发生在正文已流出之后；聊天页撤下前缀并用这句说明结果。 */
+    const val FILTERED_REPLY = "服务商拦下了这次回复。换个说法再试试。"
+
     /**
      * 带图 + 联网搜索时服务端 400 的降级说明（决策 「不阻断，但映射成明确人话」）。
      *

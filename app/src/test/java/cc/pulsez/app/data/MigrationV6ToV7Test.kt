@@ -69,12 +69,16 @@ class MigrationV6ToV7Test {
 
         downgradeToV6()
         val migrated = Room.databaseBuilder(context, PulsezDatabase::class.java, DB_NAME)
-            .addMigrations(PulsezDatabase.MIGRATION_6_7)
+            .addMigrations(
+                PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
+            )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(7, migrated.openHelper.writableDatabase.version)
+            assertEquals(9, migrated.openHelper.writableDatabase.version)
             val chunk = migrated.chunkDao().forSegment("legacy-segment").single()
             assertEquals("旧向量仍保留", "legacy-vector-chunk", chunk.id)
             assertEquals(threadId, chunk.threadId)
@@ -94,6 +98,35 @@ class MigrationV6ToV7Test {
         try {
             raw.execSQL("PRAGMA foreign_keys=OFF")
             raw.beginTransaction()
+            // 6.json has the historical 17-column attachment table; remove v9 triggers before rebuilding it.
+            val attachmentTriggers = raw.rawQuery(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='attachment'",
+                null,
+            ).use { cursor ->
+                buildList { while (cursor.moveToNext()) add(cursor.getString(0)) }
+            }
+            attachmentTriggers.forEach { raw.execSQL("DROP TRIGGER IF EXISTS `$it`") }
+            raw.execSQL("DROP INDEX IF EXISTS `index_attachment_messageId`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_attachment_status`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_attachment_ownerThreadId`")
+            // Exact v6 shape from app/schemas/.../6.json; copy every shared column and omit the v9-only binding.
+            raw.execSQL(
+                "CREATE TABLE `attachment_v6` (" +
+                    "`id` TEXT NOT NULL, `messageId` TEXT, `kind` TEXT NOT NULL, `mime` TEXT NOT NULL, " +
+                    "`localPath` TEXT NOT NULL, `fileName` TEXT, `sizeBytes` INTEGER NOT NULL, `width` INTEGER, " +
+                    "`height` INTEGER, `status` TEXT NOT NULL, `errorKind` TEXT, `attempts` INTEGER NOT NULL, " +
+                    "`remoteFileId` TEXT, `expiresAt` INTEGER, `deletedAt` INTEGER, `createdAt` INTEGER NOT NULL, " +
+                    "`ownerThreadId` TEXT, PRIMARY KEY(`id`))",
+            )
+            raw.execSQL(
+                "INSERT INTO `attachment_v6` (`id`,`messageId`,`kind`,`mime`,`localPath`,`fileName`,`sizeBytes`,`width`,`height`,`status`,`errorKind`,`attempts`,`remoteFileId`,`expiresAt`,`deletedAt`,`createdAt`,`ownerThreadId`) " +
+                    "SELECT `id`,`messageId`,`kind`,`mime`,`localPath`,`fileName`,`sizeBytes`,`width`,`height`,`status`,`errorKind`,`attempts`,`remoteFileId`,`expiresAt`,`deletedAt`,`createdAt`,`ownerThreadId` FROM `attachment`",
+            )
+            raw.execSQL("DROP TABLE `attachment`")
+            raw.execSQL("ALTER TABLE `attachment_v6` RENAME TO `attachment`")
+            raw.execSQL("CREATE INDEX `index_attachment_messageId` ON `attachment` (`messageId`)")
+            raw.execSQL("CREATE INDEX `index_attachment_status` ON `attachment` (`status`)")
+            raw.execSQL("CREATE INDEX `index_attachment_ownerThreadId` ON `attachment` (`ownerThreadId`)")
             raw.execSQL("DROP INDEX IF EXISTS `index_chunk_threadId_createdAt`")
             raw.execSQL("DROP INDEX IF EXISTS `index_chunk_threadId_lastMessageAt`")
             raw.execSQL("DROP INDEX IF EXISTS `index_chunk_threadId_model`")
@@ -113,6 +146,27 @@ class MigrationV6ToV7Test {
             raw.execSQL("CREATE INDEX `index_chunk_threadId_createdAt` ON `chunk` (`threadId`,`createdAt`)")
             raw.execSQL("CREATE INDEX `index_chunk_threadId_lastMessageAt` ON `chunk` (`threadId`,`lastMessageAt`)")
             raw.execSQL("CREATE INDEX `index_chunk_threadId_model` ON `chunk` (`threadId`,`model`)")
+            // Exact v6 message shape from app/schemas/.../6.json; omit v8 columns.
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_threadId_createdAt`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_segmentId`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_status`")
+            raw.execSQL(
+                "CREATE TABLE `message_v6` (" +
+                    "`id` TEXT NOT NULL, `threadId` TEXT NOT NULL, `segmentId` TEXT NOT NULL, " +
+                    "`role` TEXT NOT NULL, `content` TEXT NOT NULL, `tokens` INTEGER NOT NULL, " +
+                    "`emotion` TEXT, `status` TEXT NOT NULL, `draft` TEXT, `usageIn` INTEGER, " +
+                    "`usageOut` INTEGER, `previousContent` TEXT, `createdAt` INTEGER NOT NULL, " +
+                    "`deletedAt` INTEGER, `speakerCharacterId` TEXT, PRIMARY KEY(`id`))",
+            )
+            raw.execSQL(
+                "INSERT INTO `message_v6` (`id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId`) " +
+                    "SELECT `id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId` FROM `message`",
+            )
+            raw.execSQL("DROP TABLE `message`")
+            raw.execSQL("ALTER TABLE `message_v6` RENAME TO `message`")
+            raw.execSQL("CREATE INDEX `index_message_threadId_createdAt` ON `message` (`threadId`, `createdAt`)")
+            raw.execSQL("CREATE INDEX `index_message_segmentId` ON `message` (`segmentId`)")
+            raw.execSQL("CREATE INDEX `index_message_status` ON `message` (`status`)")
             raw.version = 6
             raw.setTransactionSuccessful()
         } finally {

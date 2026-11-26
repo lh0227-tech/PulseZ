@@ -23,7 +23,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
-/** v4 → current v7 keeps existing rows and leaves pre-fingerprint vectors unknown. */
+/** v4 → current v9 keeps existing rows and leaves pre-fingerprint vectors unknown. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class MigrationV4ToV5Test {
@@ -48,7 +48,7 @@ class MigrationV4ToV5Test {
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals("夹具先从当前 v7 schema 还原", 7, latest.openHelper.writableDatabase.version)
+            assertEquals("夹具先从当前 v9 schema 还原", 9, latest.openHelper.writableDatabase.version)
             latest.characterDao().upsert(
                 CharacterEntity(
                     id = "legacy-role",
@@ -149,12 +149,14 @@ class MigrationV4ToV5Test {
                 PulsezDatabase.MIGRATION_4_5,
                 PulsezDatabase.MIGRATION_5_6,
                 PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
             )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals("v4 旧库必须沿生产链升级到当前 v7", 7, migrated.openHelper.writableDatabase.version)
+            assertEquals("v4 旧库必须沿生产链升级到当前 v9", 9, migrated.openHelper.writableDatabase.version)
             assertEquals("legacy-role", migrated.characterDao().byId("legacy-role")?.id)
             assertEquals(listOf("legacy-message"), migrated.messageDao().allForThread("legacy-thread").map { it.id })
             assertEquals(99_999L, migrated.threadDao().byId("legacy-thread")?.lastMessageAt)
@@ -245,6 +247,27 @@ class MigrationV4ToV5Test {
             raw.execSQL("ALTER TABLE `thread_v4` RENAME TO `thread`")
             raw.execSQL("CREATE INDEX `index_thread_characterId` ON `thread` (`characterId`)")
             raw.execSQL("CREATE INDEX `index_thread_lastMessageAt` ON `thread` (`lastMessageAt`)")
+            // Exact v4 message shape from app/schemas/.../4.json; omit v8 columns.
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_threadId_createdAt`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_segmentId`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_status`")
+            raw.execSQL(
+                "CREATE TABLE `message_v4` (" +
+                    "`id` TEXT NOT NULL, `threadId` TEXT NOT NULL, `segmentId` TEXT NOT NULL, " +
+                    "`role` TEXT NOT NULL, `content` TEXT NOT NULL, `tokens` INTEGER NOT NULL, " +
+                    "`emotion` TEXT, `status` TEXT NOT NULL, `draft` TEXT, `usageIn` INTEGER, " +
+                    "`usageOut` INTEGER, `previousContent` TEXT, `createdAt` INTEGER NOT NULL, " +
+                    "`deletedAt` INTEGER, `speakerCharacterId` TEXT, PRIMARY KEY(`id`))",
+            )
+            raw.execSQL(
+                "INSERT INTO `message_v4` (`id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId`) " +
+                    "SELECT `id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId` FROM `message`",
+            )
+            raw.execSQL("DROP TABLE `message`")
+            raw.execSQL("ALTER TABLE `message_v4` RENAME TO `message`")
+            raw.execSQL("CREATE INDEX `index_message_threadId_createdAt` ON `message` (`threadId`, `createdAt`)")
+            raw.execSQL("CREATE INDEX `index_message_segmentId` ON `message` (`segmentId`)")
+            raw.execSQL("CREATE INDEX `index_message_status` ON `message` (`status`)")
             raw.version = 4
             raw.setTransactionSuccessful()
         } finally {

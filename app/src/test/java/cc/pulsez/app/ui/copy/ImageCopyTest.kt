@@ -82,6 +82,7 @@ class ImageCopyTest {
             "单图太大" to ImageCopy.SINGLE_TOO_LARGE,
             "合计太大" to ImageCopy.TOTAL_TOO_LARGE,
             "内容被拦" to ImageCopy.CONTENT_FILTER,
+            "回复被服务商拦下" to ImageCopy.FILTERED_REPLY,
             "搜索冲突" to ImageCopy.SEARCH_CONFLICT,
             "导入失败" to ImageCopy.IMPORT_FAILED,
             "OOM" to ImageCopy.IMPORT_OOM,
@@ -203,6 +204,13 @@ class ImageCopyTest {
         assertTrue(ImageCopy.CONTENT_FILTER.contains("换一张"))
         assertFalse("不冒称危机干预", ImageCopy.CONTENT_FILTER.contains("12356"))
         assertFalse("不指责用户", ImageCopy.CONTENT_FILTER.contains("违规"))
+    }
+
+    @Test
+    fun deepSeekFilteredReplyCopyExplainsTheResultAndOffersANextStep() {
+        assertTrue(ImageCopy.FILTERED_REPLY.contains("服务商拦下了这次回复"))
+        assertTrue(ImageCopy.FILTERED_REPLY.contains("换个说法再试试"))
+        assertFalse("不推断具体拒绝原因", ImageCopy.FILTERED_REPLY.contains("违规"))
     }
 
     @Test

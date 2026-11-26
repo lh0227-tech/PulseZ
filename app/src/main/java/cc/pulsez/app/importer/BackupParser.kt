@@ -264,6 +264,8 @@ object BackupParser {
                     // 缺 → null，恢复层用 TokenEstimator.estimate 兜底（ImportRepository.kt:399 同口径）。
                     tokens = message.intField("tokens"),
                     speakerSourceId = message.stringField("speakerCharacterId"),
+                    citationsJson = message.stringField("citationsJson"),
+                    latestReminder = message.stringField("latestReminder"),
                 )
             },
             segments = element.objects("segments").map { segment ->
@@ -649,6 +651,8 @@ data class BackupMessage(
     val tokens: Int?,
     /** `""`/缺 → null；映射不到导出角色时恢复层置 null + 计数。 */
     val speakerSourceId: String?,
+    val citationsJson: String? = null,
+    val latestReminder: String? = null,
 )
 
 data class BackupSegment(

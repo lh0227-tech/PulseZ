@@ -221,6 +221,8 @@ internal class BackupRestoreRepository(
         val createdAt: Long,
         val tokens: Int,
         val speakerId: String?,
+        val citationsJson: String? = null,
+        val latestReminder: String? = null,
     )
 
     private fun buildPlan(document: BackupDocument): RestorePlan {
@@ -526,6 +528,8 @@ internal class BackupRestoreRepository(
                 createdAt = planned.createdAt,
                 deletedAt = null,
                 speakerCharacterId = planned.speakerId,
+                citationsJson = planned.citationsJson,
+                latestReminder = planned.latestReminder,
             )
         }
 
@@ -638,6 +642,8 @@ internal class BackupRestoreRepository(
             // 导出缺失 → 本地估算（`ImportRepository.kt:399` 同口径）。
             tokens = message.tokens ?: TokenEstimator.estimate(message.content),
             speakerId = speakerId,
+            citationsJson = message.citationsJson,
+            latestReminder = message.latestReminder,
         )
     }
 

@@ -23,7 +23,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
-/** v5 → current v7 preserves old attachment and vector rows without inventing unknown metadata. */
+/** v5 → current v9 preserves old attachment and vector rows without inventing unknown metadata. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class MigrationV5ToV6Test {
@@ -103,12 +103,14 @@ class MigrationV5ToV6Test {
                 PulsezDatabase.MIGRATION_4_5,
                 PulsezDatabase.MIGRATION_5_6,
                 PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
             )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals("v5 旧库必须沿生产链升级到当前 v7", 7, migrated.openHelper.writableDatabase.version)
+            assertEquals("v5 旧库必须沿生产链升级到当前 v9", 9, migrated.openHelper.writableDatabase.version)
             assertEquals(role.id, migrated.characterDao().byId(role.id)?.id)
             assertEquals(thread.id, migrated.threadDao().byId(thread.id)?.id)
             val migratedAttachment = migrated.attachmentDao().byId("old-unbound-draft")
@@ -181,6 +183,27 @@ class MigrationV5ToV6Test {
             raw.execSQL("ALTER TABLE `attachment_v5` RENAME TO `attachment`")
             raw.execSQL("CREATE INDEX `index_attachment_messageId` ON `attachment` (`messageId`)")
             raw.execSQL("CREATE INDEX `index_attachment_status` ON `attachment` (`status`)")
+            // Exact v5 message shape from app/schemas/.../5.json; omit v8 columns.
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_threadId_createdAt`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_segmentId`")
+            raw.execSQL("DROP INDEX IF EXISTS `index_message_status`")
+            raw.execSQL(
+                "CREATE TABLE `message_v5` (" +
+                    "`id` TEXT NOT NULL, `threadId` TEXT NOT NULL, `segmentId` TEXT NOT NULL, " +
+                    "`role` TEXT NOT NULL, `content` TEXT NOT NULL, `tokens` INTEGER NOT NULL, " +
+                    "`emotion` TEXT, `status` TEXT NOT NULL, `draft` TEXT, `usageIn` INTEGER, " +
+                    "`usageOut` INTEGER, `previousContent` TEXT, `createdAt` INTEGER NOT NULL, " +
+                    "`deletedAt` INTEGER, `speakerCharacterId` TEXT, PRIMARY KEY(`id`))",
+            )
+            raw.execSQL(
+                "INSERT INTO `message_v5` (`id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId`) " +
+                    "SELECT `id`,`threadId`,`segmentId`,`role`,`content`,`tokens`,`emotion`,`status`,`draft`,`usageIn`,`usageOut`,`previousContent`,`createdAt`,`deletedAt`,`speakerCharacterId` FROM `message`",
+            )
+            raw.execSQL("DROP TABLE `message`")
+            raw.execSQL("ALTER TABLE `message_v5` RENAME TO `message`")
+            raw.execSQL("CREATE INDEX `index_message_threadId_createdAt` ON `message` (`threadId`, `createdAt`)")
+            raw.execSQL("CREATE INDEX `index_message_segmentId` ON `message` (`segmentId`)")
+            raw.execSQL("CREATE INDEX `index_message_status` ON `message` (`status`)")
             raw.version = 5
             raw.setTransactionSuccessful()
         } finally {

@@ -134,6 +134,11 @@ data class MessageEntity(
     val deletedAt: Long? = null,
     // v2 新增：群聊里这条是哪个角色说的；用户消息与单聊为 null。
     val speakerCharacterId: String? = null,
+    // v8 新增：DeepSeek 思考链、服务端工具调用、联网引用与时间感知锚点。
+    val reasoningContent: String? = null,
+    val serverToolCallsJson: String? = null,
+    val citationsJson: String? = null,
+    val latestReminder: String? = null,
 )
 
 /** Chat-list projection; segment ordinal keeps source sessions contiguous without changing stored timestamps. */
@@ -367,6 +372,14 @@ data class AttachmentEntity(
     val createdAt: Long,
     /** Thread owner for new unsent drafts; legacy unowned drafts stay null rather than guessing ownership. */
     val ownerThreadId: String? = null,
+    /** Local credential-binding identifier; null means legacy or unverifiable ownership. Never exported. */
+    val remoteCredentialBindingId: String? = null,
+)
+
+/** Minimal transient projection used when a soft delete must enqueue remote cleanup. */
+data class RemoteFileReference(
+    val remoteFileId: String,
+    val remoteCredentialBindingId: String?,
 )
 
 /** Local tombstones prevent a late importer or chat worker from recreating a permanently deleted role id. */
@@ -386,9 +399,10 @@ data class PendingAttachmentDeleteEntity(
     val lastAttemptAt: Long? = null,
 )
 
-/** `attachment.kind` 取值。v0.5.0 只做识图，故只有 IMAGE。*/
+/** `attachment.kind` 取值；v8 起支持 FILE。 */
 object AttachmentKind {
     const val IMAGE: String = "IMAGE"
+    const val FILE: String = "FILE"
 }
 
 /** `attachment.status` 取值。*/
@@ -474,6 +488,9 @@ interface ThreadDao {
 
     @Query("UPDATE thread SET lastMessageAt = :at, totalMessages = totalMessages + 1 WHERE id = :id")
     suspend fun touch(id: String, at: Long)
+
+    @Query("UPDATE thread SET lastMessageAt = :at WHERE id = :id")
+    suspend fun touchTime(id: String, at: Long)
 
     /** Monotonic event time; no message-time inference or rollback when a message is later deleted. */
     @Query(
@@ -1017,6 +1034,28 @@ interface MessageDao {
     @Query("UPDATE message SET deletedAt = :at WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
 
+    @Query("UPDATE message SET deletedAt = :at WHERE id = :id AND deletedAt IS NULL")
+    suspend fun softDeleteById(id: String, at: Long): Int
+
+    @Query(
+        "UPDATE message SET content = :content, tokens = :tokens, emotion = :emotion, " +
+            "status = :status, usageIn = :usageIn, usageOut = :usageOut, " +
+            "reasoningContent = :reasoningContent, serverToolCallsJson = :serverToolCallsJson, " +
+            "citationsJson = :citationsJson WHERE id = :id AND deletedAt IS NULL",
+    )
+    suspend fun updateReply(
+        id: String,
+        content: String,
+        tokens: Int,
+        emotion: String?,
+        status: String,
+        usageIn: Int?,
+        usageOut: Int?,
+        reasoningContent: String?,
+        serverToolCallsJson: String?,
+        citationsJson: String?,
+    ): Int
+
     @Query("DELETE FROM message WHERE threadId = :threadId")
     suspend fun deleteForThread(threadId: String)
 }
@@ -1239,6 +1278,9 @@ interface ChunkDao {
     @Query("SELECT * FROM chunk WHERE threadId = :threadId AND deletedAt IS NULL AND lastMessageAt BETWEEN :from AND :to ORDER BY lastMessageAt DESC LIMIT :limit")
     suspend fun inRange(threadId: String, from: Long, to: Long, limit: Int): List<ChunkEntity>
 
+    @Query("SELECT id FROM chunk WHERE threadId = :threadId AND deletedAt IS NULL AND messageIds LIKE '%' || :messageId || '%'")
+    suspend fun idsMatchingMessage(threadId: String, messageId: String): List<String>
+
     @Query("UPDATE chunk SET deletedAt = :at WHERE threadId = :threadId AND messageIds LIKE '%' || :messageId || '%'")
     suspend fun invalidateByMessage(threadId: String, messageId: String, at: Long)
 
@@ -1403,7 +1445,24 @@ interface AttachmentDao {
     @Query("UPDATE attachment SET status = :status, errorKind = :errorKind WHERE id = :id AND deletedAt IS NULL")
     suspend fun updateStatus(id: String, status: String, errorKind: String?): Int
 
-    /** 仍在使用的附件 id（启动孤儿文件清理的 keep 集合）。*/
+    @Query(
+        "UPDATE attachment SET remoteFileId = :remoteFileId, expiresAt = :expiresAt, " +
+            "remoteCredentialBindingId = :remoteCredentialBindingId WHERE id = :id AND deletedAt IS NULL",
+    )
+    suspend fun updateRemoteFile(
+        id: String,
+        remoteFileId: String?,
+        expiresAt: Long?,
+        remoteCredentialBindingId: String?,
+    ): Int
+
+    @Query(
+        "SELECT remoteFileId, remoteCredentialBindingId FROM attachment " +
+            "WHERE deletedAt IS NULL AND remoteFileId IS NOT NULL",
+    )
+    suspend fun liveRemoteFileReferences(): List<RemoteFileReference>
+
+    /** 仍在使用的附件 id（启动孤儿文件清理的 keep 集合）。 */
     @Query("SELECT id FROM attachment WHERE deletedAt IS NULL")
     suspend fun idsInUse(): List<String>
 }
@@ -1443,8 +1502,8 @@ interface PendingAttachmentDeleteDao {
         DeletedCharacterEntity::class,
         PendingAttachmentDeleteEntity::class,
     ],
-    // v6: durable deletion tombstones, retryable attachment cleanup, and role-owned drafts.
-    version = 7,
+    // v9: local credential binding for remote attachment cleanup; raw queue is installed by migration/callback.
+    version = 9,
     exportSchema = true,
 )
 abstract class PulsezDatabase : RoomDatabase() {
@@ -1673,6 +1732,45 @@ abstract class PulsezDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8: add nullable DeepSeek reasoning/tool/citation/latest_reminder columns on message.
+         */
+        val MIGRATION_7_8: Migration = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `message` ADD COLUMN `reasoningContent` TEXT")
+                db.execSQL("ALTER TABLE `message` ADD COLUMN `serverToolCallsJson` TEXT")
+                db.execSQL("ALTER TABLE `message` ADD COLUMN `citationsJson` TEXT")
+                db.execSQL("ALTER TABLE `message` ADD COLUMN `latestReminder` TEXT")
+            }
+        }
+
+        /**
+         * v8 → v9 adds nullable local credential-binding metadata and the two-column raw cleanup queue.
+         * Existing remote IDs intentionally migrate with unknown ownership (null); no old ID may be sent
+         * under newly entered credentials. Raw table/trigger are deliberately outside Room entities/schema.
+         */
+        val MIGRATION_8_9: Migration = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `attachment` ADD COLUMN `remoteCredentialBindingId` TEXT")
+                installRemoteFileCleanupQueue(db)
+                // v8 soft-deleted IDs were not captured at deletion time. Reserve them as unknown so a late
+                // DELETE cannot target a future reference. This changes only the raw queue; attachment rows,
+                // including any live shared references, remain untouched and unknown IDs are never sent.
+                db.execSQL(
+                    "INSERT INTO `remote_file_cleanup` (`remoteFileId`, `credentialBindingId`) " +
+                        "SELECT DISTINCT a.`remoteFileId`, NULL FROM `attachment` a " +
+                        "WHERE a.`deletedAt` IS NOT NULL AND a.`remoteFileId` IS NOT NULL " +
+                        "AND NOT EXISTS(SELECT 1 FROM `remote_file_cleanup` q " +
+                        "WHERE q.`remoteFileId` = a.`remoteFileId`)",
+                )
+                db.execSQL(
+                    "UPDATE `remote_file_cleanup` SET `credentialBindingId` = NULL " +
+                        "WHERE `remoteFileId` IN (SELECT a.`remoteFileId` FROM `attachment` a " +
+                        "WHERE a.`deletedAt` IS NOT NULL AND a.`remoteFileId` IS NOT NULL)",
+                )
+            }
+        }
+
         /** Database-level gates also cover existing ViewModels and workers that finish after deletion. */
         internal fun installRoleDeletionGuards(db: SupportSQLiteDatabase) {
             val statements = listOf(
@@ -1732,15 +1830,146 @@ abstract class PulsezDatabase : RoomDatabase() {
             statements.forEach(db::execSQL)
         }
 
-        private val ROLE_DELETION_GUARD_CALLBACK = object : RoomDatabase.Callback() {
+        /**
+         * Minimal durable remote-delete retry state: only file ID + nullable local credential binding.
+         * DELETE/soft-delete and remote-change triggers capture lost references; a BEFORE INSERT trigger covers
+         * Room REPLACE even when recursive delete triggers are off. Duplicate IDs with conflicting bindings
+         * permanently downgrade to unknown. Tombstone guards are database-level because a process mutex cannot
+         * protect against late responses after process death. SQLite trigger/conflict semantics:
+         * https://www.sqlite.org/lang_createtrigger.html and https://www.sqlite.org/lang_conflict.html
+         */
+        internal fun installRemoteFileCleanupQueue(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `remote_file_cleanup` (" +
+                    "`remoteFileId` TEXT NOT NULL, " +
+                    "`credentialBindingId` TEXT, " +
+                    "PRIMARY KEY(`remoteFileId`))",
+            )
+            db.execSQL("DROP TRIGGER IF EXISTS `enqueue_remote_file_cleanup_after_attachment_delete`")
+            db.execSQL(
+                "CREATE TRIGGER `enqueue_remote_file_cleanup_after_attachment_delete` " +
+                    "AFTER DELETE ON `attachment` " +
+                    "WHEN OLD.`remoteFileId` IS NOT NULL " +
+                    "BEGIN " +
+                    tombstoneMergeSql("OLD.`remoteFileId`", "OLD.`remoteCredentialBindingId`") +
+                    "END",
+            )
+            db.execSQL("DROP TRIGGER IF EXISTS `enqueue_remote_file_cleanup_after_attachment_remote_change`")
+            db.execSQL(
+                "CREATE TRIGGER `enqueue_remote_file_cleanup_after_attachment_remote_change` " +
+                    "AFTER UPDATE OF `remoteFileId`, `remoteCredentialBindingId` ON `attachment` " +
+                    "WHEN OLD.`remoteFileId` IS NOT NULL AND " +
+                    "(OLD.`remoteFileId` IS NOT NEW.`remoteFileId` OR " +
+                    "OLD.`remoteCredentialBindingId` IS NOT NEW.`remoteCredentialBindingId`) " +
+                    "BEGIN " +
+                    tombstoneMergeSql("OLD.`remoteFileId`", "OLD.`remoteCredentialBindingId`") +
+                    "END",
+            )
+
+            db.execSQL("DROP TRIGGER IF EXISTS `enqueue_remote_file_cleanup_after_attachment_soft_delete`")
+            db.execSQL(
+                "CREATE TRIGGER `enqueue_remote_file_cleanup_after_attachment_soft_delete` " +
+                    "AFTER UPDATE OF `deletedAt` ON `attachment` " +
+                    "WHEN OLD.`deletedAt` IS NULL AND NEW.`deletedAt` IS NOT NULL " +
+                    "AND NEW.`remoteFileId` IS NOT NULL " +
+                    "BEGIN " +
+                    tombstoneMergeSql("NEW.`remoteFileId`", "NEW.`remoteCredentialBindingId`") +
+                    "END",
+            )
+
+            // Room uses INSERT OR REPLACE for attachment upserts. REPLACE's delete trigger is conditional on
+            // recursive_triggers, so capture a displaced ID before the insert instead of relying on that delete.
+            db.execSQL("DROP TRIGGER IF EXISTS `capture_remote_file_cleanup_before_attachment_replace`")
+            db.execSQL(
+                "CREATE TRIGGER `capture_remote_file_cleanup_before_attachment_replace` " +
+                    "BEFORE INSERT ON `attachment` " +
+                    "WHEN EXISTS(SELECT 1 FROM `attachment` a WHERE a.`id` = NEW.`id` " +
+                    "AND a.`remoteFileId` IS NOT NULL AND " +
+                    "(a.`remoteFileId` IS NOT NEW.`remoteFileId` OR " +
+                    "a.`remoteCredentialBindingId` IS NOT NEW.`remoteCredentialBindingId`)) " +
+                    "BEGIN " +
+                    "INSERT INTO `remote_file_cleanup` (`remoteFileId`, `credentialBindingId`) " +
+                    "SELECT a.`remoteFileId`, a.`remoteCredentialBindingId` FROM `attachment` a " +
+                    "WHERE a.`id` = NEW.`id` AND a.`remoteFileId` IS NOT NULL " +
+                    "AND NOT EXISTS(SELECT 1 FROM `remote_file_cleanup` q " +
+                    "WHERE q.`remoteFileId` = a.`remoteFileId`); " +
+                    "UPDATE `remote_file_cleanup` SET `credentialBindingId` = " +
+                    "CASE WHEN `credentialBindingId` IS " +
+                    "(SELECT a.`remoteCredentialBindingId` FROM `attachment` a WHERE a.`id` = NEW.`id`) " +
+                    "THEN `credentialBindingId` ELSE NULL END " +
+                    "WHERE `remoteFileId` = " +
+                    "(SELECT a.`remoteFileId` FROM `attachment` a WHERE a.`id` = NEW.`id`); " +
+                    "END",
+            )
+
+            // A two-column queue row doubles as a permanent ID reservation, even after remote DELETE succeeds.
+            // Permit an exact REPLACE of an already-live shared row, but never create a new live reference or
+            // revive a soft-deleted row under a tombstoned ID. A file ID's credential binding cannot change in
+            // place: that would tombstone the old owner while leaving the same ID live under a new owner.
+            // RAISE(ABORT) stops the containing insert statement.
+            db.execSQL("DROP TRIGGER IF EXISTS `guard_remote_file_tombstone_before_attachment_insert`")
+            db.execSQL(
+                "CREATE TRIGGER `guard_remote_file_tombstone_before_attachment_insert` " +
+                    "BEFORE INSERT ON `attachment` " +
+                    "WHEN NEW.`deletedAt` IS NULL AND NEW.`remoteFileId` IS NOT NULL " +
+                    "AND (EXISTS(SELECT 1 FROM `remote_file_cleanup` q " +
+                    "WHERE q.`remoteFileId` = NEW.`remoteFileId`) " +
+                    "OR EXISTS(SELECT 1 FROM `attachment` a WHERE a.`id` = NEW.`id` " +
+                    "AND a.`deletedAt` IS NULL AND a.`remoteFileId` IS NEW.`remoteFileId` " +
+                    "AND a.`remoteCredentialBindingId` IS NOT NEW.`remoteCredentialBindingId`)) " +
+                    "AND NOT EXISTS(SELECT 1 FROM `attachment` a " +
+                    "WHERE a.`id` = NEW.`id` AND a.`deletedAt` IS NULL " +
+                    "AND a.`remoteFileId` IS NEW.`remoteFileId` " +
+                    "AND a.`remoteCredentialBindingId` IS NEW.`remoteCredentialBindingId`) " +
+                    "BEGIN SELECT RAISE(ABORT, 'remote file ID is permanently retired'); END",
+            )
+
+            db.execSQL("DROP TRIGGER IF EXISTS `guard_remote_file_tombstone_before_attachment_update`")
+            db.execSQL(
+                "CREATE TRIGGER `guard_remote_file_tombstone_before_attachment_update` " +
+                    "BEFORE UPDATE OF `remoteFileId`, `remoteCredentialBindingId`, `deletedAt` ON `attachment` " +
+                    "WHEN NEW.`deletedAt` IS NULL AND NEW.`remoteFileId` IS NOT NULL " +
+                    "AND ((EXISTS(SELECT 1 FROM `remote_file_cleanup` q " +
+                    "WHERE q.`remoteFileId` = NEW.`remoteFileId`) " +
+                    "AND (OLD.`deletedAt` IS NOT NULL " +
+                    "OR OLD.`remoteFileId` IS NOT NEW.`remoteFileId` " +
+                    "OR OLD.`remoteCredentialBindingId` IS NOT NEW.`remoteCredentialBindingId`)) " +
+                    "OR (OLD.`remoteFileId` IS NEW.`remoteFileId` " +
+                    "AND OLD.`remoteCredentialBindingId` IS NOT NEW.`remoteCredentialBindingId`)) " +
+                    "BEGIN SELECT RAISE(ABORT, 'remote file ID is permanently retired'); END",
+            )
+        }
+
+        /**
+         * Inserts a tombstone without an OR conflict clause, then permanently downgrades binding collisions.
+         * The NOT EXISTS guard avoids a duplicate-key conflict inheriting an outer INSERT OR REPLACE policy.
+         * SQLite outer conflict and REPLACE-trigger rules: https://www.sqlite.org/lang_createtrigger.html
+         * and https://www.sqlite.org/lang_conflict.html
+         */
+        private fun tombstoneMergeSql(remoteFileId: String, credentialBindingId: String): String =
+            "INSERT INTO `remote_file_cleanup` (`remoteFileId`, `credentialBindingId`) " +
+                "SELECT $remoteFileId, $credentialBindingId " +
+                "WHERE $remoteFileId IS NOT NULL AND NOT EXISTS(" +
+                "SELECT 1 FROM `remote_file_cleanup` q WHERE q.`remoteFileId` = $remoteFileId); " +
+                "UPDATE `remote_file_cleanup` SET `credentialBindingId` = " +
+                "CASE WHEN `credentialBindingId` IS $credentialBindingId " +
+                "THEN `credentialBindingId` ELSE NULL END " +
+                "WHERE `remoteFileId` = $remoteFileId; "
+
+        private val DATABASE_INVARIANTS_CALLBACK = object : RoomDatabase.Callback() {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 installRoleDeletionGuards(db)
+                installRemoteFileCleanupQueue(db)
+            }
+
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                installRemoteFileCleanupQueue(db)
             }
         }
 
         fun create(context: Context): PulsezDatabase =
             Room.databaseBuilder(context, PulsezDatabase::class.java, "pulsez.db")
-                // v1→v2→v3→v4→v5→v6→v7 链式迁移必须全部注册；历史数据均由增量迁移保留。
+                // v1→...→v8→v9 链式迁移必须全部注册；历史数据均由增量迁移保留。
                 // 刻意不加 fallbackToDestructiveMigration：宁可迁移失败暴露问题，也不静默清空用户数据。
                 .addMigrations(
                     MIGRATION_1_2,
@@ -1749,8 +1978,10 @@ abstract class PulsezDatabase : RoomDatabase() {
                     MIGRATION_4_5,
                     MIGRATION_5_6,
                     MIGRATION_6_7,
+                    MIGRATION_7_8,
+                    MIGRATION_8_9,
                 )
-                .addCallback(ROLE_DELETION_GUARD_CALLBACK)
+                .addCallback(DATABASE_INVARIANTS_CALLBACK)
                 .build()
     }
 }

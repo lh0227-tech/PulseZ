@@ -24,7 +24,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * v2 → v3（附件表）历史迁移契约测试（「可自动测」第 1 条），并升级到当前 v7。
+ * v2 → v3（附件表）历史迁移测试，并升级到当前 v9。
  *
  * 与 [MigrationV1ToV2Test] 同一套「原生 SQLite 造旧库 + 真 Room 打开」模式：
  * `androidx.room:room-testing` 不在依赖里（本写作用域不允许改 build 文件），
@@ -32,24 +32,24 @@ import org.robolectric.annotation.Config
  *
  * 1. 用**原生 SQLite** 按 v1 schema（SQL 逐字取自 `app/schemas/.../1.json`）造库并灌旧数据；
  * 2. 用**逐字复刻** `MIGRATION_1_2` 的 DDL 把库升到 v2（`Migration.migrate` 只吃
- * `SupportSQLiteDatabase`，而原生库的官方包装类是 `internal`，见 [createV2Database]），
- * 再灌 v2 特有数据（群聊 thread / thread_member / speakerCharacterId / 角色维度记忆）；
- * 3. 让**真实 Room** 打开 v2 库沿生产 2→3→4→5→6→7 完整迁移链升级；本类仍保留 v2/v3 阶段的数据、
- * 附件结构与可写性断言，Room 同时校验最终 v7 schema。
+ *    `SupportSQLiteDatabase`，而原生库的官方包装类是 `internal`，见 [createV2Database]），
+ *    再灌 v2 特有数据（群聊 thread / thread_member / speakerCharacterId / 角色维度记忆）；
+ * 3. 让**真实 Room** 打开 v2 库沿生产 2→3→4→5→6→7→8→9 完整迁移链升级；本类仍保留 v2/v3 阶段的数据、
+ *    附件结构与可写性断言，Room 同时校验最终 v9 schema。
  *
  * 复刻的 v1→v2 DDL 若与真实 v2 schema 有偏差，Room 迁移后的 `onValidateSchema`（以及本类
  * `migratedCurrentSchemaMatchesFreshCurrentSchema`）会直接失败，不会静默放过。
  *
- * Room 打开后会调用生成代码的 `onValidateSchema`，把迁移结果与编译期期望的当前 v7 表结构
+ * Room 打开后会调用生成代码的 `onValidateSchema`，把迁移结果与编译期期望的当前 v9 表结构
  * 逐列（类型 / NOT NULL / 默认值 / 主键位置）、逐索引比对，不一致直接抛
  * `IllegalStateException("Migration didn't properly handle: ...")`。
  * Room 2.6.1 `RoomOpenHelper.kt` / `TableInfo.kt`（同 MigrationV1ToV2Test 的说明）。
  *
  * 覆盖：
  * - v2 旧数据（角色/会话/段/消息/记忆/群成员）升级后一条不丢；
- * - v1→v7 链式升级（v1 用户不先经过中间版本）；
- * - 迁移后的历史相关表与全新 v7 对照一致（含 attachment 两索引），Room 校验完整 v7 schema；
- * - 迁移后 attachment 表可写（草稿/绑定/软删），全新库直接 v7 也可用。
+ * - v1→v9 链式升级（v1 用户不先经过中间版本）；
+ * - 迁移后的历史相关表与全新 v9 对照一致（含 attachment 两索引），Room 校验完整 v9 schema；
+ * - 迁移后 attachment 表可写（草稿/绑定/软删），全新库直接 v9 也可用。
  *
  * 全程 Robolectric/JVM，离线，临时库文件跑完删除。
  */
@@ -75,7 +75,7 @@ class MigrationV2ToV3Test {
     }
 
     // ------------------------------------------------------------------
-    // 1. v2 历史数据不丢、v3 附件仍可写，最终 DB 版本 = 7
+    // 1. v2 历史数据不丢、v3 附件仍可写，最终 DB 版本 = 9
     // ------------------------------------------------------------------
 
     @Test
@@ -84,7 +84,7 @@ class MigrationV2ToV3Test {
         val db = openMigrated()
         try {
             // 触发迁移 + 校验
-            assertEquals("v2 旧库必须沿生产链升级到当前 v7", 7, db.openHelper.writableDatabase.version)
+            assertEquals("v2 旧库必须沿生产链升级到当前 v9", 9, db.openHelper.writableDatabase.version)
 
             // --- v1 时代就有的数据 ---
             val thread = db.threadDao().byId(THREAD_ID)
@@ -166,7 +166,7 @@ class MigrationV2ToV3Test {
     }
 
     // ------------------------------------------------------------------
-    // 2. 结构：历史相关表与当前安装一致，Room 同时完整校验当前 v7 schema
+    // 2. 结构：历史相关表与当前安装一致，Room 同时完整校验当前 v9 schema
     // ------------------------------------------------------------------
 
     @Test
@@ -182,10 +182,10 @@ class MigrationV2ToV3Test {
         try {
             migrated.openHelper.writableDatabase
             fresh.openHelper.writableDatabase
-            assertEquals("全新安装的库版本必须是当前 v7", 7, fresh.openHelper.writableDatabase.version)
+            assertEquals("全新安装的库版本必须是当前 v9", 9, fresh.openHelper.writableDatabase.version)
 
             assertEquals(
-                "历史相关表必须与当前库一致（Room 已完整校验最终 v7 schema）",
+                "历史相关表必须与当前库一致（Room 已完整校验最终 v9 schema）",
                 schemaSnapshot(fresh),
                 schemaSnapshot(migrated),
             )
@@ -227,11 +227,11 @@ class MigrationV2ToV3Test {
     }
 
     // ------------------------------------------------------------------
-    // 3. v1 → current 链式升级：v1 用户直接升到 v7，数据不丢
+    // 3. v1 → current 链式升级：v1 用户直接升到 v9，数据不丢
     // ------------------------------------------------------------------
 
     @Test
-    fun v1ToV7ChainKeepsDataAndCreatesUsableAttachmentTable() = runBlocking {
+    fun v1ToV9ChainKeepsDataAndCreatesUsableAttachmentTable() = runBlocking {
         createV1Database(CHAIN_DB_NAME)
         val db = Room.databaseBuilder(context, PulsezDatabase::class.java, CHAIN_DB_NAME)
             .addMigrations(
@@ -241,12 +241,14 @@ class MigrationV2ToV3Test {
                 PulsezDatabase.MIGRATION_4_5,
                 PulsezDatabase.MIGRATION_5_6,
                 PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
             )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals("链式迁移后 user_version 必须是当前 v7", 7, db.openHelper.writableDatabase.version)
+            assertEquals("链式迁移后 user_version 必须是当前 v9", 9, db.openHelper.writableDatabase.version)
             assertEquals("v1 角色不应丢", CHARACTER_ID, db.characterDao().byId(CHARACTER_ID)!!.id)
             assertEquals(ThreadKind.SINGLE, db.threadDao().byId(THREAD_ID)!!.kind)
             assertEquals(2, db.messageDao().allForThread(THREAD_ID).size)
@@ -279,7 +281,7 @@ class MigrationV2ToV3Test {
     }
 
     // ------------------------------------------------------------------
-    // 4. 全新安装直接当前 v7：onCreate 建出 attachment 表且可用
+    // 4. 全新安装直接当前 v9：onCreate 建出 attachment 表且可用
     // ------------------------------------------------------------------
 
     @Test
@@ -289,8 +291,8 @@ class MigrationV2ToV3Test {
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(7, db.openHelper.writableDatabase.version)
-            assertTrue("全新当前 v7 库必须有 attachment 表", columns(db, "attachment").isNotEmpty())
+            assertEquals(9, db.openHelper.writableDatabase.version)
+            assertTrue("全新当前 v9 库必须有 attachment 表", columns(db, "attachment").isNotEmpty())
             db.attachmentDao().upsert(
                 AttachmentEntity(
                     id = "fresh-att",
@@ -322,17 +324,17 @@ class MigrationV2ToV3Test {
     // ------------------------------------------------------------------
 
     /**
- * 造 v2 库：v1 schema + v1→v2 的 DDL + v2 特有数据。
- *
- * 为什么手写 v1→v2 的 DDL 而不用生产 [PulsezDatabase.MIGRATION_1_2]：
- * `Migration.migrate` 只接受 `SupportSQLiteDatabase`，而原生 [`SQLiteDatabase`] 的官方包装类
- * `androidx.sqlite.db.framework.FrameworkSQLiteDatabase` 是 sqlite-framework 的 `internal` 类
- * （Kotlin 里不可见），本写作用域又不允许加 `room-testing`。所以这里**逐字复刻**
- * MIGRATION_1_2 的 DDL（第 2 个测试会用「迁移后历史相关表 == 全新 v7 中对应表」兜底：如果这段
- * 复刻和真实 v2 schema 有偏差，Room 的 `onValidateSchema` 会直接失败）。
- *
- * v2→v3 及后续迁移仍然跑生产代码 [PulsezDatabase.MIGRATION_2_3] 等完整链——测试要验的正是它们。
- */
+     * 造 v2 库：v1 schema + v1→v2 的 DDL + v2 特有数据。
+     *
+     * 为什么手写 v1→v2 的 DDL 而不用生产 [PulsezDatabase.MIGRATION_1_2]：
+     * `Migration.migrate` 只接受 `SupportSQLiteDatabase`，而原生 [`SQLiteDatabase`] 的官方包装类
+     * `androidx.sqlite.db.framework.FrameworkSQLiteDatabase` 是 sqlite-framework 的 `internal` 类
+     * （Kotlin 里不可见），本工作包写作用域又不允许加 `room-testing`。所以这里**逐字复刻**
+     * MIGRATION_1_2 的 DDL（第 2 个测试会用「迁移后历史相关表 == 全新 v9 中对应表」兜底：如果这段
+     * 复刻和真实 v2 schema 有偏差，Room 的 `onValidateSchema` 会直接失败）。
+     *
+     * v2→v3 及后续迁移仍然跑生产代码 [PulsezDatabase.MIGRATION_2_3] 等完整链——测试要验的正是它们。
+     */
     private fun createV2Database() {
         val dbFile = context.getDatabasePath(MIGRATED_DB_NAME)
         dbFile.parentFile?.mkdirs()
@@ -507,6 +509,8 @@ class MigrationV2ToV3Test {
                 PulsezDatabase.MIGRATION_4_5,
                 PulsezDatabase.MIGRATION_5_6,
                 PulsezDatabase.MIGRATION_6_7,
+                PulsezDatabase.MIGRATION_7_8,
+                PulsezDatabase.MIGRATION_8_9,
             )
             .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
             .allowMainThreadQueries()

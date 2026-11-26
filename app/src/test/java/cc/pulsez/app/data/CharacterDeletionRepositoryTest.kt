@@ -21,6 +21,7 @@ import cc.pulsez.app.data.repo.CharacterDeletionRepository
 import cc.pulsez.app.data.repo.CharacterRepository
 import cc.pulsez.app.data.repo.ChatRepository
 import cc.pulsez.app.data.repo.ImportRepository
+import cc.pulsez.app.data.repo.RemoteFileCleanupRepository
 import cc.pulsez.app.data.repo.RestoreResult
 import cc.pulsez.app.data.ExportService
 import cc.pulsez.app.importer.BackupInspection
@@ -63,6 +64,7 @@ class CharacterDeletionRepositoryTest {
             .allowMainThreadQueries()
             .build()
         PulsezDatabase.installRoleDeletionGuards(db.openHelper.writableDatabase)
+        PulsezDatabase.installRemoteFileCleanupQueue(db.openHelper.writableDatabase)
         characters = CharacterRepository(db)
         chat = ChatRepository(db)
         storeDir = File(context.cacheDir, "role-delete-${System.nanoTime()}")
@@ -129,6 +131,12 @@ class CharacterDeletionRepositoryTest {
         )
         attachmentRepo.markReady(singleAttachment.id)
         attachmentRepo.bindToMessage(listOf(singleAttachment.id), singleMessage.id)
+        attachmentRepo.setRemoteFile(
+            id = singleAttachment.id,
+            remoteFileId = "role-delete-remote-id",
+            expiresAt = null,
+            remoteCredentialBindingId = "role-delete-binding",
+        )
         val groupAttachment = attachmentRepo.createDraft(
             store,
             AttachmentKind.IMAGE,
@@ -172,6 +180,10 @@ class CharacterDeletionRepositoryTest {
         assertTrue(db.chunkDao().searchTerms(deletedThread.id, listOf("private"), 10).isEmpty())
         assertEquals(1, db.chunkDao().searchTerms(group.id, listOf("shared"), 10).size)
         assertNull(db.attachmentDao().byId(singleAttachment.id))
+        assertEquals(
+            listOf("role-delete-remote-id"),
+            RemoteFileCleanupRepository(db).pendingFor("role-delete-binding"),
+        )
         assertNotNull(db.attachmentDao().byId(groupAttachment.id))
         assertNull("旧版无法归属的草稿保留，不猜测属于已删角色", db.attachmentDao().byId(legacyUnownedDraft.id)?.messageId)
         assertFalse(store.exists(singleAttachment.localPath))

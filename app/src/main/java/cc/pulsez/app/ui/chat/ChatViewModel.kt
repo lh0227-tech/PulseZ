@@ -1,6 +1,8 @@
 package cc.pulsez.app.ui.chat
 
+import android.content.ContentResolver
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -21,10 +23,14 @@ import cc.pulsez.app.audio.VoiceRecorderStatus
 import cc.pulsez.app.core.AwakeningCommitResult
 import cc.pulsez.app.core.AwakeningStatus
 import cc.pulsez.app.core.CharacterAwakeningManager
+import cc.pulsez.app.core.LatestReminder
 import cc.pulsez.app.core.UsageLimits
+import cc.pulsez.app.data.attachments.AttachmentErrorCodes
 import cc.pulsez.app.data.attachments.AttachmentException
 import cc.pulsez.app.data.db.AttachmentKind
 import cc.pulsez.app.data.db.AttachmentStatus
+import cc.pulsez.app.data.db.ImportSourceSessionEntity
+import cc.pulsez.app.data.db.MessageEntity
 import cc.pulsez.app.data.repo.UsageCategory
 import cc.pulsez.app.data.settings.ImageEntryState
 import cc.pulsez.app.data.settings.Settings
@@ -41,15 +47,23 @@ import cc.pulsez.app.net.ApiError
 import cc.pulsez.app.net.ChatMessage
 import cc.pulsez.app.net.ChatRequest
 import cc.pulsez.app.net.Citation
+import cc.pulsez.app.net.FilesClient
 import cc.pulsez.app.net.LlmEvent
+import cc.pulsez.app.net.LlmClient
+import cc.pulsez.app.net.UploadedFile
+import cc.pulsez.app.net.isDeepSeekEndpoint
+import cc.pulsez.app.ui.copy.ChatActionCopy
 import cc.pulsez.app.ui.copy.ImageCopy
 import cc.pulsez.app.ui.copy.VoiceCopy
 import cc.pulsez.app.util.Ids
 import cc.pulsez.app.wire.ErrorCopy
 import cc.pulsez.app.wire.Pricing
 import cc.pulsez.app.wire.ProtocolTag
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -60,7 +74,59 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * A remote ID is reusable only when both sides carry the same known local credential binding.
+ * Local HMAC bindings are specific to an endpoint and credential; DeepSeek Files API IDs belong to an account:
+ * https://api-docs.deepseek.com/guides/files_api/
+ */
+internal fun canReuseRemoteFile(
+    remoteFileId: String?,
+    storedBindingId: String?,
+    sessionBindingId: String?,
+): Boolean = !remoteFileId.isNullOrBlank() &&
+    !storedBindingId.isNullOrBlank() &&
+    !sessionBindingId.isNullOrBlank() &&
+    storedBindingId == sessionBindingId
+
+/** A short commit fence: Stop can cancel before mutation starts; after it starts, the result is synchronized. */
+internal class MessageActionFence {
+    private enum class State { ACTIVE, COMMITTING, CANCELLED, DONE }
+
+    private val state = AtomicReference(State.ACTIVE)
+
+    fun beginCommit(isStillAllowed: () -> Boolean): Boolean {
+        if (!state.compareAndSet(State.ACTIVE, State.COMMITTING)) return false
+        if (isStillAllowed()) return true
+        state.compareAndSet(State.COMMITTING, State.CANCELLED)
+        return false
+    }
+
+    /** Returns false once a transaction owns the commit boundary. */
+    fun cancelBeforeCommit(): Boolean =
+        state.compareAndSet(State.ACTIVE, State.CANCELLED) || state.get() == State.CANCELLED
+
+    fun canContinue(): Boolean = state.get() == State.COMMITTING
+
+    fun isCommitting(): Boolean = state.get() == State.COMMITTING
+
+    fun complete() {
+        state.compareAndSet(State.COMMITTING, State.DONE)
+    }
+}
 
 /**
  * 聊天页状态机（基线）。
@@ -82,7 +148,14 @@ import java.io.File
 class ChatViewModel(
     private val container: AppContainer,
     private val characterId: String,
+    private val beforeLoadPublishForTest: (suspend () -> Unit)? = null,
+    private val beforeLoadOlderPublishForTest: (suspend () -> Unit)? = null,
 ) : ViewModel() {
+
+    /** Narrow offline seams for credential-swap and upload/clear race tests; production leaves these null. */
+    internal var endpointSessionResolverForTest: (suspend () -> AppContainer.ChatEndpointSession?)? = null
+    internal var fileUploaderForTest: (suspend (File, String, String) -> UploadedFile)? = null
+    internal var beforePersistUploadedFileForTest: (suspend (String) -> Unit)? = null
 
     data class UiState(
         val name: String = "",
@@ -122,9 +195,15 @@ class ChatViewModel(
         val imageInputVisible: Boolean = false,
         /** 图片入口是否可用（DeepSeek 端点但模型看不了图时=false：入口置灰 + 点击说明）。 */
         val imageInputEnabled: Boolean = false,
+        /** 文件入口是否可用（仅 DeepSeek 官方端点启用，不依赖是否支持识图）。 */
+        val fileInputEnabled: Boolean = false,
         /** 草稿里的图（≤3；准备中/失败态由界面显示状态）。 */
         val drafts: List<DraftImage> = emptyList(),
-        /** 底部「拍照 / 从相册选」面板是否打开。 */
+        /** 草稿里的普通文件（≤3；准备中/就绪态）。 */
+        val fileDrafts: List<DraftFile> = emptyList(),
+        /** 正在上传文件到 DeepSeek Files API（发送中临时锁住，完成后转流式）。 */
+        val uploadingFiles: Boolean = false,
+        /** 底部「拍照 / 从相册选 / 发文件」面板是否打开。 */
         val showImageSource: Boolean = false,
         /** 首次带图发送前的说明弹窗（只弹一次，非阻断）。*/
         val showImageIntro: Boolean = false,
@@ -147,6 +226,22 @@ class ChatViewModel(
         val threadId: String,
         val wipeEpoch: Long,
         val onAccepted: (() -> Unit)?,
+        var fileCredentialBindingId: String? = null,
+    )
+
+    private data class RegenerationRecovery(
+        val actionId: Long,
+        val assistantId: String,
+        val original: ChatUiMessage,
+        val userDbId: String,
+    )
+
+    private data class ActiveMessageFence(val actionId: Long, val fence: MessageActionFence)
+
+    private data class ActiveUserAppendFence(
+        val attemptId: Long,
+        val fence: MessageActionFence,
+        val stopAfterCommit: AtomicBoolean = AtomicBoolean(false),
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -185,7 +280,25 @@ class ChatViewModel(
     /** One in-flight send attempt; it remains bound to its synchronous session/wipe identity. */
     private var nextSendAttemptId: Long = 0L
     private var activeSendAttempt: SendAttempt? = null
+    private var sendPreparationJob: Job? = null
+    private var sendPreparationJobOwnerId: Long? = null
+    private var fileSendAttemptId: Long? = null
+    private var uploadRequestAttemptId: Long? = null
+    private var filePickerGeneration: Long = 0L
+    private var nextOlderLoadId: Long = 0L
+    private var activeOlderLoadId: Long? = null
+    /** Accepted send identity is read by Room transaction callbacks running on IO. */
+    private val activeSendTurnAttempt = AtomicReference<SendAttempt?>(null)
+    /** Main-thread owner for Stop; callbacks only touch its atomic fence and stop bit. */
+    private var activeUserAppendFence: ActiveUserAppendFence? = null
     private var pendingImageIntroAttempt: SendAttempt? = null
+    private var nextMessageActionId: Long = 0L
+    private var activeMessageActionId: Long? = null
+    private var activeMessageStreamActionId: Long? = null
+    private var messageActionJobOwnerId: Long? = null
+    private var messageActionJob: Job? = null
+    private var regenerationRecovery: RegenerationRecovery? = null
+    private var activeMessageFence: ActiveMessageFence? = null
 
     // ---------------------------------------------------------- v0.5.1 语音输入运行时
 
@@ -233,7 +346,14 @@ class ChatViewModel(
         viewModelScope.launch {
             container.wipeEpoch.collect { epoch ->
                 if (epoch != wipeEpochAtCreation) {
+                    filePickerGeneration += 1L
+                    cancelPendingFileSendAttempt(showUnconfirmedNotice = false)
                     invalidateSendAttempt()
+                    activeUserAppendFence?.fence?.cancelBeforeCommit()
+                    activeUserAppendFence = null
+                    cancelPendingMessageAction()
+                    activeMessageFence?.fence?.cancelBeforeCommit()
+                    activeMessageFence = null
                     cancelStreamForWipe()
                 }
             }
@@ -248,6 +368,8 @@ class ChatViewModel(
      * `AppRoot` 用清空 token 换全新 VM 负责。语音/图片等本机动作不在 范围（不写旧会话）。
      */
     private fun cancelStreamForWipe() {
+        regenerationRecovery = null
+        activeMessageStreamActionId = null
         streamJob?.cancel()
         streamJob = null
         awakeningJob?.cancel()
@@ -255,6 +377,7 @@ class ChatViewModel(
         reunionInProgress = false
         _state.value = _state.value.copy(
             streaming = false,
+            uploadingFiles = false,
             awakening = AwakeningUiState(),
             voice = _state.value.voice.copy(awakeningBridge = null),
         )
@@ -269,12 +392,64 @@ class ChatViewModel(
 
     /** Clear only the attempt that owns the current slot, so a stale coroutine cannot clear a newer send. */
     private fun invalidateSendAttempt(attempt: SendAttempt? = null) {
-        if (attempt != null && activeSendAttempt?.id != attempt.id) return
-        activeSendAttempt = null
-        pendingImageIntroAttempt = null
-        if (_state.value.showImageIntro) {
-            _state.value = _state.value.copy(showImageIntro = false)
+        val ownsUnacceptedAttempt = attempt == null || activeSendAttempt?.id == attempt.id
+        if (attempt == null) {
+            activeSendAttempt = null
+            fileSendAttemptId = null
+            uploadRequestAttemptId = null
+            activeSendTurnAttempt.set(null)
+            activeUserAppendFence?.fence?.cancelBeforeCommit()
+            activeUserAppendFence = null
+        } else {
+            val accepted = activeSendTurnAttempt.get()?.takeIf { it.id == attempt.id }
+            if (!ownsUnacceptedAttempt && accepted == null) return
+            if (ownsUnacceptedAttempt) activeSendAttempt = null
+            accepted?.let {
+                activeSendTurnAttempt.compareAndSet(it, null)
+            }
+            if (activeUserAppendFence?.attemptId == attempt.id) {
+                activeUserAppendFence?.fence?.cancelBeforeCommit()
+                activeUserAppendFence = null
+            }
+            if (pendingImageIntroAttempt?.id == attempt.id) pendingImageIntroAttempt = null
+            if (fileSendAttemptId == attempt.id) fileSendAttemptId = null
+            if (uploadRequestAttemptId == attempt.id) uploadRequestAttemptId = null
         }
+        if (ownsUnacceptedAttempt) {
+            pendingImageIntroAttempt = null
+            val snapshot = _state.value
+            if (snapshot.showImageIntro || snapshot.uploadingFiles) {
+                _state.value = snapshot.copy(showImageIntro = false, uploadingFiles = false)
+            }
+        }
+    }
+
+    /** Stop only the file-bearing preparation job; successful IDs are synchronized separately. */
+    private fun cancelPendingFileSendAttempt(showUnconfirmedNotice: Boolean) {
+        val attempt = activeSendAttempt?.takeIf { it.id == fileSendAttemptId } ?: return
+        val requestMayHaveReachedService = uploadRequestAttemptId == attempt.id
+        val job = sendPreparationJob.takeIf { sendPreparationJobOwnerId == attempt.id }
+        invalidateSendAttempt(attempt)
+        job?.cancel()
+        if (showUnconfirmedNotice && requestMayHaveReachedService) {
+            _state.value = _state.value.copy(notice = ChatActionCopy.FILE_UPLOAD_CANCELLED_UNCONFIRMED)
+        }
+    }
+
+    private fun launchSendPreparation(attempt: SendAttempt, block: suspend () -> Unit) {
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                block()
+            } finally {
+                if (sendPreparationJobOwnerId == attempt.id) {
+                    sendPreparationJobOwnerId = null
+                    sendPreparationJob = null
+                }
+            }
+        }
+        sendPreparationJob = job
+        sendPreparationJobOwnerId = attempt.id
+        job.start()
     }
 
     private fun consumeSendAttempt(attempt: SendAttempt): Boolean {
@@ -284,6 +459,83 @@ class ChatViewModel(
         }
         activeSendAttempt = null
         pendingImageIntroAttempt = null
+        if (fileSendAttemptId == attempt.id) fileSendAttemptId = null
+        if (uploadRequestAttemptId == attempt.id) uploadRequestAttemptId = null
+        return true
+    }
+
+    private fun isCurrentAcceptedSend(attempt: SendAttempt): Boolean =
+        activeSendTurnAttempt.get()?.id == attempt.id &&
+            attempt.wipeEpoch == container.wipeEpoch.value
+
+    private fun finishAcceptedSend(attempt: SendAttempt, appendFence: ActiveUserAppendFence) {
+        activeSendTurnAttempt.compareAndSet(attempt, null)
+        if (activeUserAppendFence?.attemptId == appendFence.attemptId) {
+            activeUserAppendFence = null
+        }
+    }
+
+    /** Claim the shared message-action slot synchronously, before a DB/settings read can suspend. */
+    private fun reserveMessageAction(snapshot: UiState): Long? {
+        if (snapshot.isAwakening || snapshot.streaming || snapshot.uploadingFiles ||
+            activeSendAttempt != null || activeUserAppendFence != null ||
+            activeMessageActionId != null || activeMessageStreamActionId != null
+        ) return null
+        return (++nextMessageActionId).also { activeMessageActionId = it }
+    }
+
+    private fun ownsMessageAction(id: Long): Boolean = activeMessageActionId == id
+
+    /** Release only the caller's reservation; a canceled older action cannot unlock a newer one. */
+    private fun releaseMessageAction(id: Long) {
+        if (activeMessageActionId != id) return
+        activeMessageActionId = null
+        if (messageActionJobOwnerId == id) {
+            messageActionJobOwnerId = null
+            messageActionJob = null
+        }
+    }
+
+    private fun cancelPendingMessageAction() {
+        val id = activeMessageActionId ?: return
+        activeMessageActionId = null
+        if (messageActionJobOwnerId == id) {
+            val job = messageActionJob
+            messageActionJobOwnerId = null
+            messageActionJob = null
+            job?.cancel()
+        }
+    }
+
+    private fun launchMessageAction(
+        id: Long,
+        onFailure: (Throwable) -> Unit,
+        action: suspend () -> Unit,
+    ) {
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                action()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                if (ownsMessageAction(id)) onFailure(failure)
+            } finally {
+                releaseMessageAction(id)
+            }
+        }
+        messageActionJobOwnerId = id
+        messageActionJob = job
+        job.start()
+    }
+
+    /** Transition the synchronous reservation to the streaming flag without opening a race window. */
+    private fun transferMessageActionToStream(id: Long): Boolean {
+        if (!ownsMessageAction(id)) return false
+        activeMessageActionId = null
+        if (messageActionJobOwnerId == id) {
+            messageActionJobOwnerId = null
+            messageActionJob = null
+        }
         return true
     }
 
@@ -297,40 +549,48 @@ class ChatViewModel(
         val loadWipeEpoch = container.wipeEpoch.value
         val character = container.characters.get(characterId) ?: return
         if (wipeChangedSince(loadWipeEpoch)) return
-        val thread = container.chat.ensureThread(characterId)
-        threadId = thread.id
-        segmentId = thread.activeSegmentId ?: ""
+        val thread = container.chat.ensureThreadForLoad(
+            characterId = characterId,
+            canContinue = { !wipeChangedSince(loadWipeEpoch) },
+        ) ?: return
+        if (wipeChangedSince(loadWipeEpoch)) return
         val history = container.chat.chatTailInSegmentOrder(thread.id, limit = INITIAL_PAGE_SIZE)
+        if (wipeChangedSince(loadWipeEpoch)) return
         val importSourcesBySegment = container.importRepository
             .importSourcesForThread(thread.id)
             .associateBy { it.segmentId }
+        if (wipeChangedSince(loadWipeEpoch)) return
         // 创作模式：进页读一次当前开关；**不**在每轮发送时轮询设置。
-        // 依赖 契约：`Settings.creativeMode` / `SettingsStore.setCreativeMode(...)`。
+        // 设置通过 `Settings.creativeMode` 读取，并由 `SettingsStore` 保存。
         val settings = container.settings.flow.first()
-        val imagePaths = imagePathsByMessage()
+        if (wipeChangedSince(loadWipeEpoch)) return
+        val attachments = liveMessageAttachments()
+        beforeLoadPublishForTest?.invoke()
+        // Every read above can suspend. If wipe starts while this snapshot is being assembled,
+        // leave the initial loading state untouched and do not install a stale thread cursor.
+        if (wipeChangedSince(loadWipeEpoch)) return
+        threadId = thread.id
+        segmentId = thread.activeSegmentId ?: ""
         // 游标 = 已加载的最早一条（tail 返回正序，first 就是最早）。
         oldestSegmentOrdinal = history.firstOrNull()?.segmentOrdinal
         oldestCreatedAt = history.firstOrNull()?.message?.createdAt
         oldestId = history.firstOrNull()?.message?.id
         val entry = settings.imageEntryState()
+        val isDeepSeek = settings.isDeepSeekProvider()
         _state.value = _state.value.copy(
             name = character.name,
             messages = history.map {
                 val message = it.message
-                ChatUiMessage(
-                    id = message.id,
-                    role = message.role,
-                    text = message.content,
-                    imagePaths = imagePaths[message.id].orEmpty(),
-                    sourceSessionId = importSourcesBySegment[message.segmentId]?.sourceSessionId,
-                    sourceTitle = importSourcesBySegment[message.segmentId]?.title,
-                    sourceStartedAt = importSourcesBySegment[message.segmentId]?.sourceStartedAt,
+                message.toUiMessage(
+                    attachments = attachments,
+                    importSource = importSourcesBySegment[message.segmentId],
                 )
             },
             ready = true,
             creativeMode = settings.creativeMode,
             imageInputVisible = entry != ImageEntryState.HIDDEN_OTHER_PROVIDER,
             imageInputEnabled = entry == ImageEntryState.ENABLED,
+            fileInputEnabled = isDeepSeek,
             // 取满一页就假定还有更早的：多一次"空结果"的点击成本，比漏掉历史好；
             // 真正为空时 loadOlder 会立即把 hasMoreOlder 置 false（不重不漏由游标保证）。
             hasMoreOlder = history.size >= INITIAL_PAGE_SIZE,
@@ -450,10 +710,9 @@ class ChatViewModel(
         val nextName = commit.updatedName ?: current.name
         val greeting = commit.greetingMessage
         val nextMessages = if (greeting != null && current.messages.none { it.id == greeting.id }) {
-            current.messages + ChatUiMessage(
-                id = greeting.id,
-                role = greeting.role,
-                text = greeting.content,
+            current.messages + greeting.toUiMessage(
+                attachments = LiveMessageAttachments(),
+                importSource = null,
             )
         } else {
             current.messages
@@ -483,41 +742,55 @@ class ChatViewModel(
         val snapshot = _state.value
         if (snapshot.loadingOlder || !snapshot.hasMoreOlder) return
         if (threadId.isEmpty()) return
+        val loadWipeEpoch = container.wipeEpoch.value
+        val loadThreadId = threadId
         val cursorOrdinal = oldestSegmentOrdinal ?: return
         val cursorAt = oldestCreatedAt ?: return
         val cursorId = oldestId ?: return
+        val loadId = ++nextOlderLoadId
+        activeOlderLoadId = loadId
         _state.value = snapshot.copy(loadingOlder = true, error = null)
         viewModelScope.launch {
-            runCatching {
+            try {
                 val older = withContext(Dispatchers.IO) {
                     container.chat.chatTailBeforeInSegmentOrder(
-                        threadId,
+                        loadThreadId,
                         cursorOrdinal,
                         cursorAt,
                         cursorId,
                         OLDER_PAGE_SIZE,
                     )
                 }
-                Triple(
-                    older,
-                    imagePathsByMessage(),
-                    container.importRepository.importSourcesForThread(threadId).associateBy { it.segmentId },
-                )
-            }.onSuccess { (older, imagePaths, importSourcesBySegment) ->
+                val attachments = liveMessageAttachments()
+                val importSourcesBySegment = container.importRepository
+                    .importSourcesForThread(loadThreadId)
+                    .associateBy { it.segmentId }
+                beforeLoadOlderPublishForTest?.invoke()
+                // AppContainer.notifyUserDataWiped 在清空入口递增代际；分页、附件、导入来源是
+                // 分开的挂起读取，最终校验拒绝清空开始后读到的旧页写回 UI。
+                if (activeOlderLoadId != loadId) return@launch
+                if (threadId != loadThreadId) {
+                    activeOlderLoadId = null
+                    _state.value = _state.value.copy(loadingOlder = false)
+                    return@launch
+                }
+                if (wipeChangedSince(loadWipeEpoch)) {
+                    activeOlderLoadId = null
+                    _state.value = _state.value.copy(loadingOlder = false)
+                    return@launch
+                }
+
                 if (older.isEmpty()) {
+                    activeOlderLoadId = null
                     _state.value = _state.value.copy(loadingOlder = false, hasMoreOlder = false)
                 } else {
+                    activeOlderLoadId = null
                     _state.value = _state.value.copy(
                         messages = older.map {
                             val message = it.message
-                            ChatUiMessage(
-                                id = message.id,
-                                role = message.role,
-                                text = message.content,
-                                imagePaths = imagePaths[message.id].orEmpty(),
-                                sourceSessionId = importSourcesBySegment[message.segmentId]?.sourceSessionId,
-                                sourceTitle = importSourcesBySegment[message.segmentId]?.title,
-                                sourceStartedAt = importSourcesBySegment[message.segmentId]?.sourceStartedAt,
+                            message.toUiMessage(
+                                attachments = attachments,
+                                importSource = importSourcesBySegment[message.segmentId],
                             )
                         } + _state.value.messages,
                         loadingOlder = false,
@@ -527,11 +800,24 @@ class ChatViewModel(
                     oldestCreatedAt = older.first().message.createdAt
                     oldestId = older.first().message.id
                 }
-            }.onFailure {
-                _state.value = _state.value.copy(
-                    loadingOlder = false,
-                    error = "更早的消息没找到。再试一次？",
-                )
+            } catch (cancelled: CancellationException) {
+                if (activeOlderLoadId == loadId) {
+                    activeOlderLoadId = null
+                    _state.value = _state.value.copy(loadingOlder = false)
+                }
+                throw cancelled
+            } catch (_: Throwable) {
+                if (activeOlderLoadId == loadId) {
+                    activeOlderLoadId = null
+                    if (threadId == loadThreadId && !wipeChangedSince(loadWipeEpoch)) {
+                        _state.value = _state.value.copy(
+                            loadingOlder = false,
+                            error = "更早的消息没找到。再试一次？",
+                        )
+                    } else {
+                        _state.value = _state.value.copy(loadingOlder = false)
+                    }
+                }
             }
         }
     }
@@ -621,41 +907,290 @@ class ChatViewModel(
     }
 
     /**
-     * 设置页/端点/模型变化后同步图片入口三态（v0.5.0 识图）。
+     * 设置页/端点/模型变化后同步图片入口三态（v0.5.0 识图）与 DeepSeek 文件入口门禁（v0.6.10）。
      *
      * 与 [syncCreativeMode] 同一定位：事件驱动（AppRoot 观察设置流），不每轮轮询；
      * 真正发送前仍会用最新设置重算一次门禁（防御，见 [send]）。
      */
-    fun syncImageGate(visible: Boolean, enabled: Boolean) {
+    fun syncImageGate(visible: Boolean, enabled: Boolean, fileEnabled: Boolean = visible) {
         val snapshot = _state.value
-        if (snapshot.imageInputVisible == visible && snapshot.imageInputEnabled == enabled) return
-        _state.value = snapshot.copy(imageInputVisible = visible, imageInputEnabled = enabled)
+        if (snapshot.imageInputVisible == visible &&
+            snapshot.imageInputEnabled == enabled &&
+            snapshot.fileInputEnabled == fileEnabled
+        ) {
+            return
+        }
+        _state.value = snapshot.copy(
+            imageInputVisible = visible,
+            imageInputEnabled = enabled,
+            fileInputEnabled = fileEnabled,
+        )
     }
 
-    // ---------------------------------------------------------------- v0.5.0 识图：草稿
+    // ---------------------------------------------------------------- v0.5.0 识图 / v0.6.10 文件：草稿
 
     /**
      * 点输入条内部右下角的「＋」。
      *
-     * 三态行为：
-     * - 入口隐藏（非 DeepSeek 端点）：忽略，不出现假入口；
-     * - 现在这个 AI 看不了图：不打开面板，给一句去向（`ImageCopy.VISION_MODEL_DISABLED`，
-     *   v0.5.0 按 ` 改成说人话，不再出现「模型」/模型 id）；
-     * - 可用：打开「拍照 / 从相册选」底部面板（满 3 张时提示上限）。
+     * - 非 DeepSeek 端点（图与文件入口都关）：忽略；
+     * - DeepSeek 端点但模型看不了图、且文件入口也未开：给去向轻提示；
+     * - 否则打开底部面板（非识图 DeepSeek 端点下在面板内灰显拍照/相册，只让选文件）。
      */
     fun onAddImage() {
         val snapshot = _state.value
         if (snapshot.isAwakening) return
-        if (!snapshot.imageInputVisible) return
-        if (!snapshot.imageInputEnabled) {
+        if (!snapshot.imageInputVisible && !snapshot.fileInputEnabled) return
+        if (!snapshot.imageInputEnabled && !snapshot.fileInputEnabled) {
             _state.value = snapshot.copy(notice = ImageCopy.VISION_MODEL_DISABLED)
             return
         }
-        if (!DraftRules.canAdd(snapshot.drafts)) {
+        if (snapshot.imageInputEnabled && !snapshot.fileInputEnabled && !DraftRules.canAdd(snapshot.drafts)) {
             _state.value = snapshot.copy(notice = ImageCopy.LIMIT_REACHED)
             return
         }
         _state.value = snapshot.copy(showImageSource = true, notice = null)
+    }
+
+    fun showNotice(message: String) {
+        _state.value = _state.value.copy(notice = message)
+    }
+
+    /**
+     * 选择普通文件回调：拷贝进私有目录、按 DeepSeek Files API 上限提前卡控体积（文档 100 MiB / 纯文 32 MiB）。
+     */
+    fun onFilePicked(uri: Uri, contentResolver: ContentResolver) {
+        val snapshot = _state.value
+        if (snapshot.uploadingFiles || fileSendAttemptId != null) {
+            _state.value = snapshot.copy(notice = ChatActionCopy.FILE_REMOVE_BLOCKED)
+            return
+        }
+        if (activeSendAttempt != null) {
+            _state.value = snapshot.copy(notice = ChatActionCopy.FILE_SEND_BLOCKED_PREPARING)
+            return
+        }
+        if (snapshot.isAwakening) return
+        if (!snapshot.fileInputEnabled) {
+            _state.value = snapshot.copy(notice = ChatActionCopy.FILE_OTHER_PROVIDER)
+            return
+        }
+        if (!FileDraftRules.canAdd(snapshot.fileDrafts)) {
+            _state.value = snapshot.copy(notice = ChatActionCopy.FILE_LIMIT_REACHED)
+            return
+        }
+        _state.value = snapshot.copy(showImageSource = false)
+        val ownerThreadId = threadId
+        val pickerGeneration = filePickerGeneration
+        val pickerWipeEpoch = container.wipeEpoch.value
+        val placeholderId = "file-draft-${Ids.new()}"
+        var resolvedFileName = "文件"
+        var resolvedMime = "application/octet-stream"
+        _state.value = snapshot.copy(
+            showImageSource = false,
+            fileDrafts = snapshot.fileDrafts + DraftFile(
+                id = placeholderId,
+                localPath = "",
+                fileName = "文件",
+                mime = "application/octet-stream",
+                sizeBytes = 0L,
+                purpose = FilesClient.PURPOSE_USER_DATA,
+                status = DraftStatus.PREPARING,
+            ),
+            notice = null,
+        )
+        viewModelScope.launch {
+            var resolvedPurpose = FilesClient.PURPOSE_USER_DATA
+            var createdAttachmentId: String? = null
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val metadata = queryUriMetadata(contentResolver, uri)
+                    val fileName = metadata.displayName
+                        ?.takeIf { it.isNotBlank() }
+                        ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                        ?: "文件"
+                    val mime = contentResolver.getType(uri)
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "application/octet-stream"
+                    val purpose = FilesClient.purposeForFile(fileName, mime)
+                    resolvedFileName = fileName
+                    resolvedMime = mime
+                    resolvedPurpose = purpose
+                    // FilesClient.maxBytesForFile follows the official per-file category limits.
+                    val maxBytes = FilesClient.maxBytesForFile(fileName, mime)
+                    val declaredSize = metadata.sizeBytes
+                    if (declaredSize != null && declaredSize > maxBytes) {
+                        throw AttachmentException(AttachmentErrorCodes.TOO_LARGE, "file exceeds $maxBytes bytes")
+                    }
+                    val stream = contentResolver.openInputStream(uri)
+                        ?: throw AttachmentException(AttachmentErrorCodes.STORE_IO, "cannot open input stream")
+                    val created = stream.use { input ->
+                        container.attachments.createFileDraft(
+                            store = container.attachmentStore,
+                            mime = mime,
+                            stream = input,
+                            fileName = fileName,
+                            maxBytes = maxBytes,
+                            ownerThreadId = ownerThreadId.takeIf { it.isNotBlank() },
+                        )
+                    }
+                    createdAttachmentId = created.id
+                    container.attachments.markReady(created.id)
+                }
+            }.onSuccess { entity ->
+                if (!isCurrentFilePickerResult(pickerGeneration, ownerThreadId, pickerWipeEpoch)) {
+                    withContext(Dispatchers.IO) { discardFileDraftAndRequestCleanup(entity.id) }
+                    return@onSuccess
+                }
+                val applied = replaceFileDraft(placeholderId) {
+                    DraftFile(
+                        id = entity.id,
+                        localPath = entity.localPath,
+                        fileName = entity.fileName?.takeIf { it.isNotBlank() } ?: "文件",
+                        mime = entity.mime,
+                        sizeBytes = entity.sizeBytes,
+                        purpose = resolvedPurpose,
+                        status = DraftStatus.READY,
+                        remoteFileId = entity.remoteFileId,
+                    )
+                }
+                if (!applied) {
+                    withContext(Dispatchers.IO) {
+                        discardFileDraftAndRequestCleanup(entity.id)
+                    }
+                }
+            }.onFailure { throwable ->
+                createdAttachmentId?.let { createdId ->
+                    withContext(NonCancellable + Dispatchers.IO) {
+                        runCatching { discardFileDraftAndRequestCleanup(createdId) }
+                    }
+                }
+                if (throwable is CancellationException) throw throwable
+                if (!isCurrentFilePickerResult(pickerGeneration, ownerThreadId, pickerWipeEpoch)) {
+                    return@onFailure
+                }
+                val noticeText = if ((throwable as? AttachmentException)?.code == AttachmentErrorCodes.TOO_LARGE) {
+                    ChatActionCopy.fileTooLarge(resolvedFileName, resolvedMime)
+                } else {
+                    ChatActionCopy.FILE_READ_FAILED
+                }
+                _state.value = _state.value.copy(
+                    fileDrafts = _state.value.fileDrafts.filterNot { it.id == placeholderId },
+                    notice = noticeText,
+                )
+            }
+        }
+    }
+
+    private fun isCurrentFilePickerResult(generation: Long, ownerThreadId: String, wipeEpoch: Long): Boolean =
+        generation == filePickerGeneration && ownerThreadId == threadId && !wipeChangedSince(wipeEpoch)
+
+    private suspend fun discardFileDraftAndRequestCleanup(id: String) {
+        try {
+            container.attachments.discardDraft(id, container.attachmentStore)
+        } finally {
+            // AttachmentRepository commits the tombstone and remote cleanup queue in one transaction.
+            // Signal only after that suspend call has committed or failed; a harmless empty scan is safe.
+            container.remoteFileCleanupCoordinator.requestRetry()
+        }
+    }
+
+    private suspend fun resolveChatEndpoint(): AppContainer.ChatEndpointSession? {
+        val resolver = endpointSessionResolverForTest
+        return if (resolver == null) container.resolvedChatEndpoint() else resolver()
+    }
+
+    private suspend fun persistUploadedFileReference(
+        attachmentId: String,
+        uploadedId: String,
+        expiresAt: Long?,
+        bindingId: String,
+    ): Boolean = withContext(NonCancellable) {
+        beforePersistUploadedFileForTest?.invoke(uploadedId)
+        var bound = false
+        try {
+            bound = withContext(Dispatchers.IO) {
+                container.attachments.setRemoteFile(
+                    id = attachmentId,
+                    remoteFileId = uploadedId,
+                    expiresAt = expiresAt,
+                    remoteCredentialBindingId = bindingId,
+                ) > 0
+            }
+        } catch (_: Throwable) {
+            bound = false
+        }
+        try {
+            if (!bound) {
+                withContext(Dispatchers.IO) {
+                    container.remoteFileCleanup.enqueue(uploadedId, bindingId)
+                }
+            }
+        } catch (_: Throwable) {
+            // A database outage can prevent both the bind and fallback queue; report failure without claiming cleanup.
+        } finally {
+            container.remoteFileCleanupCoordinator.requestRetry()
+        }
+        bound
+    }
+
+    private fun replaceFileDraft(id: String, transform: (DraftFile) -> DraftFile): Boolean {
+        val snapshot = _state.value
+        if (snapshot.fileDrafts.none { it.id == id }) return false
+        _state.value = snapshot.copy(
+            fileDrafts = snapshot.fileDrafts.map { if (it.id == id) transform(it) else it },
+        )
+        return true
+    }
+
+    fun removeFileDraft(id: String) {
+        if (_state.value.uploadingFiles || fileSendAttemptId != null) {
+            _state.value = _state.value.copy(notice = ChatActionCopy.FILE_REMOVE_BLOCKED)
+            return
+        }
+        val target = _state.value.fileDrafts.firstOrNull { it.id == id } ?: return
+        _state.value = _state.value.copy(
+            fileDrafts = _state.value.fileDrafts.filterNot { it.id == id },
+            notice = null,
+        )
+        if (target.status != DraftStatus.PREPARING && target.id.isNotBlank() && !target.id.startsWith("file-draft-")) {
+            viewModelScope.launch {
+                try {
+                    withContext(Dispatchers.IO) { discardFileDraftAndRequestCleanup(target.id) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    if (_state.value.fileDrafts.none { it.id == target.id }) {
+                        _state.value = _state.value.copy(
+                            fileDrafts = _state.value.fileDrafts + target,
+                            notice = ChatActionCopy.FILE_REMOVE_FAILED,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private data class UriMetadata(
+        val displayName: String? = null,
+        val sizeBytes: Long? = null,
+    )
+
+    private fun queryUriMetadata(resolver: ContentResolver, uri: Uri): UriMetadata {
+        return runCatching {
+            resolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use UriMetadata()
+                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                val name = if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null
+                val size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else null
+                UriMetadata(displayName = name, sizeBytes = size)
+            } ?: UriMetadata()
+        }.getOrDefault(UriMetadata())
     }
 
     /** 关掉「拍照 / 从相册选」面板（返回手势/点外面都会走到）。 */
@@ -858,15 +1393,15 @@ class ChatViewModel(
             invalidateSendAttempt(attempt)
             return
         }
-        viewModelScope.launch {
+        launchSendPreparation(attempt) {
             if (!isCurrentSendAttempt(attempt)) {
                 invalidateSendAttempt(attempt)
-                return@launch
+                return@launchSendPreparation
             }
             runCatching { container.settings.setImageIntroSeen(true) }
             if (!isCurrentSendAttempt(attempt)) {
                 invalidateSendAttempt(attempt)
-                return@launch
+                return@launchSendPreparation
             }
             sendInternal(null, attempt)
         }
@@ -1150,6 +1685,8 @@ class ChatViewModel(
     fun onVoicePageLeft() {
         // ChatScreen uses this existing disposal hook because chat ViewModels are cached per role
         // and may outlive the route. A pending image acknowledgement must not send after leaving it.
+        filePickerGeneration += 1L
+        cancelPendingFileSendAttempt(showUnconfirmedNotice = true)
         invalidateSendAttempt()
         cancelVoiceForLifecycle(clearMode = true)
     }
@@ -1618,17 +2155,25 @@ class ChatViewModel(
     fun send(onAccepted: (() -> Unit)? = null) {
         val snapshot = _state.value
         if (snapshot.isAwakening) return
-        if (snapshot.streaming || activeSendAttempt != null) return
+        if (snapshot.streaming || snapshot.uploadingFiles || activeSendAttempt != null ||
+            activeUserAppendFence != null ||
+            activeMessageActionId != null || activeMessageStreamActionId != null
+        ) return
         // v0.5.1：发送 = 本轮语音输入结束。录音/转写中一律取消并删音频（状态机 SendStarted 口径）。
         cancelVoiceForSend()
         val text = snapshot.input.trim()
         val readyDrafts = snapshot.drafts.filter { it.status == DraftStatus.READY }
-        // 准备中：不要发（否则会先发文字、图片下一轮才到，模型对不上）。
+        val readyFiles = snapshot.fileDrafts.filter { it.status == DraftStatus.READY }
+        // 准备中：不要发（否则会先发文字、附件下一轮才到，模型对不上）。
         if (DraftRules.isPreparing(snapshot.drafts)) {
             _state.value = snapshot.copy(notice = ImageCopy.SEND_BLOCKED_PREPARING)
             return
         }
-        if (text.isEmpty() && readyDrafts.isEmpty()) return
+        if (FileDraftRules.isPreparing(snapshot.fileDrafts)) {
+            _state.value = snapshot.copy(notice = ChatActionCopy.FILE_SEND_BLOCKED_PREPARING)
+            return
+        }
+        if (text.isEmpty() && readyDrafts.isEmpty() && readyFiles.isEmpty()) return
         if (threadId.isEmpty()) return
         // Capture the attempt identity at the synchronous user action, before settings reads or
         // the optional first-image explanation can suspend. Basis: AppContainer.kt:457-495.
@@ -1640,19 +2185,28 @@ class ChatViewModel(
             onAccepted = onAccepted,
         )
         activeSendAttempt = attempt
-        // 发送新消息 = 停掉上一轮还在读的回复（停止条件）。
+        if (readyFiles.isNotEmpty()) {
+            fileSendAttemptId = attempt.id
+            // This is also the synchronous UI/method gate while settings and local ownership checks run.
+            _state.value = _state.value.copy(
+                uploadingFiles = true,
+                error = null,
+                notice = null,
+            )
+        }
+        // 发送新消息会停止上一轮仍在读取的回复。
         // 放在最前面：即使这轮被花费上限拦住、没真正发出去，也已经不需要继续读了。
         container.reader.stop()
 
-        viewModelScope.launch {
+        launchSendPreparation(attempt) {
             if (!isCurrentSendAttempt(attempt)) {
                 invalidateSendAttempt(attempt)
-                return@launch
+                return@launchSendPreparation
             }
             val settings = container.settings.flow.first()
             if (!isCurrentSendAttempt(attempt)) {
                 invalidateSendAttempt(attempt)
-                return@launch
+                return@launchSendPreparation
             }
             // 防御性门禁（v0.5 识图）：设置可能在停留期间被改成"看不了图的模型"。
             if (readyDrafts.isNotEmpty() && settings.imageEntryState() != ImageEntryState.ENABLED) {
@@ -1660,13 +2214,20 @@ class ChatViewModel(
                     _state.value = _state.value.copy(notice = ImageCopy.VISION_MODEL_DISABLED)
                 }
                 invalidateSendAttempt(attempt)
-                return@launch
+                return@launchSendPreparation
+            }
+            if (readyFiles.isNotEmpty() && !settings.isDeepSeekProvider()) {
+                if (isCurrentSendAttempt(attempt)) {
+                    _state.value = _state.value.copy(notice = ChatActionCopy.FILE_OTHER_PROVIDER)
+                }
+                invalidateSendAttempt(attempt)
+                return@launchSendPreparation
             }
             // 首用说明：**首次带图发送前**弹一次；两个按钮都不阻断发送。
             if (readyDrafts.isNotEmpty() && !settings.imageIntroSeen) {
                 pendingImageIntroAttempt = attempt
                 _state.value = _state.value.copy(showImageIntro = true)
-                return@launch
+                return@launchSendPreparation
             }
             sendInternal(settings, attempt)
         }
@@ -1690,7 +2251,8 @@ class ChatViewModel(
         val snapshot = _state.value
         val text = snapshot.input.trim()
         val readyDrafts = snapshot.drafts.filter { it.status == DraftStatus.READY }
-        if (text.isEmpty() && readyDrafts.isEmpty()) {
+        val readyFiles = snapshot.fileDrafts.filter { it.status == DraftStatus.READY }
+        if (text.isEmpty() && readyDrafts.isEmpty() && readyFiles.isEmpty()) {
             invalidateSendAttempt(attempt)
             return
         }
@@ -1744,25 +2306,175 @@ class ChatViewModel(
             return
         }
 
-        // 纯图消息也要有可读正文（导出/降级/无附件时）；占位与 ChatEngine 约定一致。
-        val content = if (text.isNotEmpty()) text else ImageCopy.IMAGE_PLACEHOLDER
+        if (readyFiles.isNotEmpty()) {
+            if (!current.isDeepSeekProvider()) {
+                _state.value = _state.value.copy(notice = ChatActionCopy.FILE_OTHER_PROVIDER)
+                invalidateSendAttempt(attempt)
+                return
+            }
+            val session = resolveChatEndpoint()
+            if (session == null) {
+                _state.value = _state.value.copy(error = ChatActionCopy.FILE_NO_KEY)
+                invalidateSendAttempt(attempt)
+                return
+            }
+            if (!isDeepSeekEndpoint(session.baseUrl)) {
+                _state.value = _state.value.copy(notice = ChatActionCopy.FILE_OTHER_PROVIDER)
+                invalidateSendAttempt(attempt)
+                return
+            }
+            if (session.settingsSnapshot?.isDeepSeekProvider() != true) {
+                _state.value = _state.value.copy(notice = ChatActionCopy.FILE_SESSION_UNAVAILABLE)
+                invalidateSendAttempt(attempt)
+                return
+            }
+            val bindingId = session.remoteCredentialBindingId?.takeIf(String::isNotBlank)
+            if (bindingId == null) {
+                _state.value = _state.value.copy(notice = ChatActionCopy.FILE_BINDING_UNAVAILABLE)
+                invalidateSendAttempt(attempt)
+                return
+            }
+            attempt.fileCredentialBindingId = bindingId
+            _state.value = _state.value.copy(uploadingFiles = true, error = null, notice = null)
+            val filesClient = FilesClient(container.http, session.baseUrl, session.apiKey)
+            for (fileDraft in readyFiles) {
+                if (!isCurrentSendAttempt(attempt)) {
+                    invalidateSendAttempt(attempt)
+                    return
+                }
+                val attachment = withContext(Dispatchers.IO) {
+                    container.database.attachmentDao().byId(fileDraft.id)
+                }
+                val attachmentIsCurrent = attachment != null &&
+                    attachment.deletedAt == null &&
+                    attachment.kind == AttachmentKind.FILE &&
+                    attachment.status == AttachmentStatus.READY &&
+                    attachment.messageId == null &&
+                    attachment.localPath == fileDraft.localPath &&
+                    (attachment.ownerThreadId == null || attachment.ownerThreadId == attempt.threadId)
+                if (!attachmentIsCurrent) {
+                    if (isCurrentSendAttempt(attempt)) {
+                        _state.value = _state.value.copy(notice = ChatActionCopy.FILE_DRAFT_UNAVAILABLE)
+                    }
+                    invalidateSendAttempt(attempt)
+                    return
+                }
+                attachment ?: run {
+                    invalidateSendAttempt(attempt)
+                    return
+                }
+                if (canReuseRemoteFile(
+                        attachment.remoteFileId,
+                        attachment.remoteCredentialBindingId,
+                        bindingId,
+                    )
+                ) {
+                    replaceFileDraft(fileDraft.id) { it.copy(remoteFileId = attachment.remoteFileId) }
+                    continue
+                }
+
+                val uploaded = try {
+                    val localFile = withContext(Dispatchers.IO) {
+                        container.attachmentStore.path(attachment.localPath)
+                    }
+                    uploadRequestAttemptId = attempt.id
+                    val uploadName = attachment.fileName?.takeIf(String::isNotBlank) ?: fileDraft.fileName
+                    val uploadPurpose = FilesClient.purposeForFile(uploadName, attachment.mime)
+                    val uploadOverride = fileUploaderForTest
+                    if (uploadOverride == null) {
+                        filesClient.uploadFile(localFile, uploadName, uploadPurpose)
+                    } else {
+                        uploadOverride(localFile, uploadName, uploadPurpose)
+                    }
+                } catch (err: Throwable) {
+                    if (err is CancellationException) throw err
+                    if (isCurrentSendAttempt(attempt)) {
+                        _state.value = _state.value.copy(
+                            uploadingFiles = false,
+                            error = ChatActionCopy.fileUploadFailure(err),
+                        )
+                    }
+                    invalidateSendAttempt(attempt)
+                    return
+                } finally {
+                    if (uploadRequestAttemptId == attempt.id) uploadRequestAttemptId = null
+                }
+
+                // Once the server returned an ID, finish the tiny local bind-or-enqueue handoff even if Stop or
+                // wipe invalidated the attempt. The DAO rejects deleted drafts; the fallback tombstone is durable.
+                val bound = persistUploadedFileReference(
+                    attachmentId = attachment.id,
+                    uploadedId = uploaded.id,
+                    expiresAt = uploaded.expiresAt,
+                    bindingId = bindingId,
+                )
+                if (!bound) {
+                    if (isCurrentSendAttempt(attempt)) {
+                        _state.value = _state.value.copy(
+                            uploadingFiles = false,
+                            error = ChatActionCopy.FILE_BIND_SAVE_FAILED,
+                        )
+                    }
+                    invalidateSendAttempt(attempt)
+                    return
+                }
+                if (!isCurrentSendAttempt(attempt)) {
+                    invalidateSendAttempt(attempt)
+                    return
+                }
+                replaceFileDraft(fileDraft.id) { it.copy(remoteFileId = uploaded.id) }
+            }
+            if (!isCurrentSendAttempt(attempt)) {
+                invalidateSendAttempt(attempt)
+                return
+            }
+            val latestSession = resolveChatEndpoint()
+            val latestBindingId = latestSession?.remoteCredentialBindingId?.takeIf(String::isNotBlank)
+            if (latestSession == null ||
+                !isDeepSeekEndpoint(latestSession.baseUrl) ||
+                latestSession.settingsSnapshot?.isDeepSeekProvider() != true ||
+                latestBindingId != bindingId
+            ) {
+                if (isCurrentSendAttempt(attempt)) {
+                    _state.value = _state.value.copy(notice = ChatActionCopy.FILE_BINDING_CHANGED)
+                }
+                invalidateSendAttempt(attempt)
+                return
+            }
+        }
+
+        // 纯图/纯文件消息也要有可读正文（导出/降级/无附件时）；占位与 ChatEngine 约定一致。
+        val content = when {
+            text.isNotEmpty() -> text
+            readyDrafts.isNotEmpty() -> ImageCopy.IMAGE_PLACEHOLDER
+            else -> ChatActionCopy.FILE_PLACEHOLDER
+        }
         val imageTokens = cc.pulsez.app.mem.TokenEstimator.estimateImages(readyDrafts.size)
         val imagePaths = DraftRules.readyPaths(readyDrafts)
+        val fileNames = readyFiles.map { it.fileName }
+        val allDraftIds = readyDrafts.map { it.id } + readyFiles.map { it.id }
 
+        val userLocalId = "local-user-${System.currentTimeMillis()}"
         val userMessage = ChatUiMessage(
-            id = "local-user-${System.currentTimeMillis()}",
+            id = userLocalId,
             role = "user",
             text = content,
             imagePaths = imagePaths,
+            fileNames = fileNames,
         )
         val assistantId = "local-ai-${System.currentTimeMillis()}"
         // Recheck the identity captured when Send was tapped; never sample the post-wipe epoch here.
         if (!consumeSendAttempt(attempt)) {
             return
         }
+        val appendFence = ActiveUserAppendFence(attempt.id, MessageActionFence())
+        activeSendTurnAttempt.set(attempt)
+        activeUserAppendFence = appendFence
         _state.value = _state.value.copy(
             input = "",
             drafts = emptyList(),
+            fileDrafts = emptyList(),
+            uploadingFiles = false,
             showImageSource = false,
             error = null,
             notice = null,
@@ -1772,17 +2484,26 @@ class ChatViewModel(
         // 依据：当前轮的校验、额度和清空门禁已通过；本地用户消息已随状态一起提交。
         runCatching { attempt.onAccepted?.invoke() }
         streamJob = viewModelScope.launch {
-            runTurn(
-                settings = current,
-                text = content,
-                readyDraftIds = readyDrafts.map { it.id },
-                imageCount = readyDrafts.size,
-                imageTokens = imageTokens,
-                imagePaths = imagePaths,
-                assistantId = assistantId,
-                threadId = attempt.threadId,
-                wipeEpoch = attempt.wipeEpoch,
-            )
+            try {
+                runTurn(
+                    settings = current,
+                    text = content,
+                    readyDraftIds = allDraftIds,
+                    failedImageDraftIds = readyDrafts.map { it.id },
+                    failedFileDrafts = readyFiles,
+                    imageCount = readyDrafts.size,
+                    imageTokens = imageTokens,
+                    imagePaths = imagePaths,
+                    userLocalId = userLocalId,
+                    assistantId = assistantId,
+                    threadId = attempt.threadId,
+                    wipeEpoch = attempt.wipeEpoch,
+                    attempt = attempt,
+                    appendFence = appendFence,
+                )
+            } finally {
+                finishAcceptedSend(attempt, appendFence)
+            }
         }
     }
 
@@ -1791,110 +2512,276 @@ class ChatViewModel(
         settings: Settings,
         text: String,
         readyDraftIds: List<String>,
+        failedImageDraftIds: List<String>,
+        failedFileDrafts: List<DraftFile>,
         imageCount: Int,
         imageTokens: Int,
         imagePaths: List<String>,
+        userLocalId: String,
         assistantId: String,
         threadId: String,
         wipeEpoch: Long,
+        attempt: SendAttempt,
+        appendFence: ActiveUserAppendFence,
     ) {
-        // v0.5.4 清空已发生 → 这一轮整体作废（不落用户消息、不发请求）。
-        // 正常路径（没清空）这一步恒为 false，行为不变。
-        if (wipeChangedSince(wipeEpoch)) {
-            _state.value = _state.value.copy(streaming = false)
+        // Attempt identity and the captured clear generation are checked before any durable work.
+        if (!isCurrentAcceptedSend(attempt) || wipeChangedSince(wipeEpoch)) {
             return
+        }
+        val initialLatestReminder = if (settings.isDeepSeekProvider()) {
+            LatestReminder.format(System.currentTimeMillis())
+        } else {
+            null
         }
         // 用户消息先落库；返回值 `MessageEntity.id` 要传给索引（chunk.messageIds = 删除传播的来源）。
         // tokens 里把图片按 1024/张保守计入（交接口径：图片占上下文，宁可早交接也别顶爆窗口）。
-        val userRow = container.chat.append(
-            threadId = threadId,
-            segmentId = segmentId,
-            role = "user",
-            text = text,
-            tokens = text.length / 2 + 4 + imageTokens,
-            // Persisted before network work starts: later request failure still counts as a real chat.
-            recordSingleChatActivity = true,
+        val userRow = try {
+            // Once Room grants the transaction and the fence enters COMMITTING, Stop waits for
+            // this result handoff; if Stop wins before then, the transaction gate rejects it.
+            // NonCancellable also prevents a committed result from being lost during dispatcher
+            // return. Wipe epoch checks inside the transaction still abort before commit.
+            withContext(NonCancellable) {
+                withContext(Dispatchers.IO) {
+                    container.chat.appendUserForTurn(
+                        threadId = threadId,
+                        segmentId = segmentId,
+                        text = text,
+                        tokens = text.length / 2 + 4 + imageTokens,
+                        latestReminder = initialLatestReminder,
+                        canBeginCommit = {
+                            appendFence.fence.beginCommit {
+                                isCurrentAcceptedSend(attempt) && !wipeChangedSince(wipeEpoch)
+                            }
+                        },
+                        canContinue = {
+                            appendFence.fence.canContinue() &&
+                                isCurrentAcceptedSend(attempt) && !wipeChangedSince(wipeEpoch)
+                        },
+                    )
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            appendFence.fence.complete()
+            throw cancelled
+        } catch (_: Throwable) {
+            appendFence.fence.complete()
+            if (isCurrentAcceptedSend(attempt) && !wipeChangedSince(wipeEpoch)) {
+                _state.value = _state.value.copy(
+                    drafts = failedImageDraftIds.map { id ->
+                        DraftImage(
+                            id = id,
+                            localPath = imagePaths.getOrNull(failedImageDraftIds.indexOf(id)).orEmpty(),
+                            status = DraftStatus.FAILED,
+                        )
+                    },
+                    fileDrafts = failedFileDrafts.map { it.copy(status = DraftStatus.FAILED) },
+                )
+                fail(assistantId, ChatActionCopy.RETRY_FAILED)
+            }
+            return
+        }
+        appendFence.fence.complete()
+        if (userRow == null) return
+        // No suspension between this epoch/attempt check and ID handoff: a wipe that races after
+        // the transaction's final gate clears the committed row in its queued Room transaction.
+        if (!isCurrentAcceptedSend(attempt) || wipeChangedSince(wipeEpoch)) return
+        attachPersistedUserIds(
+            userLocalId = userLocalId,
+            userDbId = userRow.id,
+            assistantId = assistantId,
         )
-        // 草稿绑定到刚落的这条消息（同一事务；v0.5 图片发送路径）。
+        // 草稿绑定到刚落的这条用户消息；若清空先完成，后续状态检查会阻止发请求。
         if (readyDraftIds.isNotEmpty()) {
-            val bindError = runCatching {
+            val bindError = try {
                 withContext(Dispatchers.IO) {
                     container.attachments.bindToMessage(readyDraftIds, userRow.id)
                 }
-            }.exceptionOrNull()
+                null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                failure
+            }
+            if (!isCurrentAcceptedSend(attempt) || wipeChangedSince(wipeEpoch)) return
             if (bindError != null) {
-                // 图片没绑上就别发这一轮（模型收不到图、用户会以为发了）：
-                // 把草稿放回列表标失败，让用户能重试/删除，而不是静默丢图。
-
-                // 回收口径（` DB 语义见 `）：
-                // 这里**不立即 discard**——绑定失败多为瞬时 DB 错误，直接删掉用户刚选的图
-                // 体验更差。注意 UI 的 FAILED 只是展示态，**DB 行仍是 READY、messageId 仍为 null**：
-                // `bindToMessage` 整批回滚（状态推进 SENT 也一并回滚），且生产代码从不写
-                // `AttachmentStatus.FAILED`（全仓只有读取过滤）。真正回收有两条路径：
-                // ① 用户点删除 → `removeDraft` 走 `discardDraft`；
-                // ② 用户不管/进程被杀 → 启动时 `sweepStaleDrafts` 按 24h TTL 把「未绑定旧行」
-                //    回收（起 TTL 条件纳入 READY，不再只认 DRAFT/FAILED）。
+                // 附件没绑上就别发这一轮：把草稿放回列表标失败，让用户能重试/删除，而不是静默丢附件。
                 _state.value = _state.value.copy(
-                    drafts = readyDraftIds.map { id ->
+                    drafts = failedImageDraftIds.map { id ->
                         DraftImage(
                             id = id,
-                            localPath = imagePaths.getOrNull(readyDraftIds.indexOf(id)).orEmpty(),
+                            localPath = imagePaths.getOrNull(failedImageDraftIds.indexOf(id)).orEmpty(),
                             status = DraftStatus.FAILED,
                             errorCode = (bindError as? AttachmentException)?.code,
                         )
                     },
+                    fileDrafts = failedFileDrafts.map { it.copy(status = DraftStatus.FAILED) },
                 )
-                fail(assistantId, ImageCopy.IMPORT_FAILED)
+                fail(assistantId, ImageCopy.IMPORT_FAILED, targetUserDbId = userRow.id)
                 return
             }
         }
+        if (!isCurrentAcceptedSend(attempt) || wipeChangedSince(wipeEpoch)) return
+        if (appendFence.stopAfterCommit.get()) {
+            _state.value = _state.value.copy(streaming = false)
+            return
+        }
+        if (activeUserAppendFence?.attemptId == attempt.id) activeUserAppendFence = null
         // Pure-image messages count only after the message row and attachment binding both persist.
         // Text-bearing messages already recorded their event atomically in ChatRepository.append.
         if (text.isBlank() && readyDraftIds.isNotEmpty()) {
             container.chat.recordActivityForImageMessage(threadId, userRow.id)
         }
-        val client = container.llmClient()
-        if (client == null) {
-            fail(assistantId, "还没连上 AI。去「设置 → 聊天」填一下？")
+        executeTurnForUserRow(
+            settings = settings,
+            userRow = userRow,
+            imageCount = imageCount,
+            assistantId = assistantId,
+            threadId = threadId,
+            wipeEpoch = wipeEpoch,
+            acceptedSendAttempt = attempt,
+        )
+    }
+
+    /**
+     * 针对已落库的 [userRow] 组装上下文并发起流式回复（首轮、失败原地重试、重新生成共用）。
+     */
+    private suspend fun executeTurnForUserRow(
+        settings: Settings,
+        userRow: MessageEntity,
+        imageCount: Int,
+        assistantId: String,
+        threadId: String,
+        wipeEpoch: Long,
+        replaceAssistantDbId: String? = null,
+        preservedAssistant: ChatUiMessage? = null,
+        messageActionId: Long? = null,
+        messageActionFence: MessageActionFence? = null,
+        acceptedSendAttempt: SendAttempt? = null,
+    ) {
+        if (wipeChangedSince(wipeEpoch) ||
+            (acceptedSendAttempt != null && !isCurrentAcceptedSend(acceptedSendAttempt))
+        ) return
+        val text = userRow.content
+        // Resolve one credential/settings snapshot for the whole request. It carries the local binding used
+        // to filter historical DeepSeek file IDs; never pair a fresh key with settings from another snapshot.
+        val session = resolveChatEndpoint()
+        val turnSettings = session?.settingsSnapshot
+        if (session == null || turnSettings == null) {
+            val message = "还没连上 AI。去「设置 → 聊天」填一下？"
+            if (preservedAssistant != null) {
+                restoreRegeneratedAssistant(assistantId, preservedAssistant, userRow.id, message, messageActionId)
+            } else {
+                fail(assistantId, message, targetUserDbId = userRow.id)
+            }
+            clearActiveMessageStream(messageActionId)
             return
         }
-        val thread = container.database.threadDao().byId(threadId) ?: return
-        val prepared = runCatching {
-            // 把刚落库的用户消息 id 传下去：`prepare` 读到的本段历史**已包含这条**，
-            // 不排除的话 ⑤ 段会再追加一次，模型每轮收到两条相同的话
-            // 。
-            // 同时 `prepare` 会从 attachment 表读出当轮图（绑定在 userRow.id 上）
-            // 与"最近 1 个带图用户轮"，组装成 content parts（识图）。
-            container.engine.prepare(thread, characterId, text, excludeMessageId = userRow.id)
-        }.getOrNull()
+        val uploadedFileBindingId = acceptedSendAttempt?.fileCredentialBindingId
+        if (uploadedFileBindingId != null &&
+            uploadedFileBindingId != session.remoteCredentialBindingId?.takeIf(String::isNotBlank)
+        ) {
+            if (preservedAssistant != null) {
+                restoreRegeneratedAssistant(
+                    assistantId,
+                    preservedAssistant,
+                    userRow.id,
+                    ChatActionCopy.FILE_BINDING_CHANGED,
+                    messageActionId,
+                )
+            } else {
+                fail(assistantId, ChatActionCopy.FILE_BINDING_CHANGED, targetUserDbId = userRow.id)
+            }
+            clearActiveMessageStream(messageActionId)
+            return
+        }
+        val client = LlmClient(container.http, session.baseUrl, session.apiKey)
+        val thread = container.database.threadDao().byId(threadId)
+        if (wipeChangedSince(wipeEpoch) ||
+            (acceptedSendAttempt != null && !isCurrentAcceptedSend(acceptedSendAttempt))
+        ) return
+        if (thread == null) {
+            if (preservedAssistant != null) {
+                restoreRegeneratedAssistant(
+                    assistantId,
+                    preservedAssistant,
+                    userRow.id,
+                    ChatActionCopy.REGENERATE_FAILED,
+                    messageActionId,
+                )
+            } else {
+                fail(assistantId, ChatActionCopy.RETRY_FAILED, targetUserDbId = userRow.id)
+            }
+            clearActiveMessageStream(messageActionId)
+            return
+        }
+        val prepared = try {
+            // 把已落库的用户消息 id 传下去：`prepare` 读到的本段历史**已包含这条**，
+            // 不排除的话 ⑤ 段会再追加一次；重试/重新生成复用同一 `latestReminder` 保缓存一致。
+            container.engine.prepare(
+                thread = thread,
+                characterId = characterId,
+                userText = text,
+                excludeMessageId = userRow.id,
+                reuseLatestReminder = userRow.latestReminder,
+                additionalExcludedMessageIds = replaceAssistantDbId?.let { setOf(it) } ?: emptySet(),
+                requestSettings = turnSettings,
+                remoteCredentialBindingId = session.remoteCredentialBindingId,
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            null
+        }
+        if (wipeChangedSince(wipeEpoch) ||
+            (acceptedSendAttempt != null && !isCurrentAcceptedSend(acceptedSendAttempt))
+        ) return
         if (prepared == null) {
-            fail(assistantId, "这轮对话刚刚没连稳，再试一次？")
+            if (preservedAssistant != null) {
+                restoreRegeneratedAssistant(
+                    assistantId,
+                    preservedAssistant,
+                    userRow.id,
+                    ChatActionCopy.REGENERATE_FAILED,
+                    messageActionId,
+                )
+            } else {
+                fail(assistantId, "这轮对话刚刚没连稳，再试一次？", targetUserDbId = userRow.id)
+            }
+            clearActiveMessageStream(messageActionId)
             return
         }
-        val deepSeek = settings.isDeepSeekProvider()
-        val thinking = deepSeek && settings.thinkingEnabled
+        val deepSeek = isDeepSeekEndpoint(session.baseUrl)
+        val thinking = deepSeek && turnSettings.thinkingEnabled
         val request = ChatRequest(
             model = prepared.model,
             messages = prepared.messages,
-            temperature = if (settings.creativeMode) CREATIVE_TEMPERATURE else DEFAULT_TEMPERATURE,
+            temperature = if (turnSettings.creativeMode) CREATIVE_TEMPERATURE else DEFAULT_TEMPERATURE,
             topP = DEFAULT_TOP_P,
             stream = true,
             // 思考开着要给足输出空间：默认 800 会被思考内容吃光、正文变空；
             // 创作模式非思考放宽到 8,192，让角色能把画面感和剧情展开。
             maxTokens = when {
                 thinking -> THINKING_MAX_TOKENS
-                settings.creativeMode -> CREATIVE_MAX_TOKENS
+                turnSettings.creativeMode -> CREATIVE_MAX_TOKENS
                 else -> DEFAULT_MAX_TOKENS
             },
             // 思考 / 联网搜索是 DeepSeek 私有能力：只有 DeepSeek 端点才发这些字段，
             // 其它服务商保持"不传"的原行为，避免 400 或假开关。
             thinking = if (deepSeek) thinking else null,
             // 思考强度用设置页的值（低/高/极高，默认低）；只在 thinking=enabled 时下发。
-            reasoningEffort = settings.reasoningEffort,
-            // 联网搜索与图片**不互斥**（「不阻断」）；服务端若 400，
+            reasoningEffort = turnSettings.reasoningEffort,
+            // 联网搜索与图片**不互斥**；服务端若 400，
             // 失败分支会用 ImageCopy.SEARCH_CONFLICT 提示"可以先把搜索关掉再试"。
-            webSearch = deepSeek && settings.webSearchEnabled,
+            webSearch = deepSeek && turnSettings.webSearchEnabled,
+            // DeepSeek 网页阅读：`readUrl = deepSeek && (webSearchEnabled || 消息含 http/https URL)`。
+            readUrl = shouldEnableReadUrl(deepSeek, turnSettings.webSearchEnabled, text),
         )
+
+        // Last synchronous guard before collection starts the network request. Main-thread wipe/Stop
+        // actions cannot interleave between this check and collect unless a suspension occurs.
+        if (wipeChangedSince(wipeEpoch) ||
+            (acceptedSendAttempt != null && !isCurrentAcceptedSend(acceptedSendAttempt))
+        ) return
 
         val buffer = StringBuilder()
         // 思考增量单独累积：不进正文。
@@ -1909,6 +2796,9 @@ class ChatViewModel(
                 is LlmEvent.Reasoning -> {
                     reasoningBuffer.append(event.text)
                     updateAssistantReasoning(assistantId, reasoningBuffer.toString())
+                }
+                is LlmEvent.ToolProgress -> {
+                    updateAssistantToolProgress(assistantId, ChatActionCopy.toolProgressText(event))
                 }
                 is LlmEvent.Finished -> {
                     finished = true
@@ -1941,33 +2831,163 @@ class ChatViewModel(
                             finalText = finalText.trimEnd() + "\n\n" + line
                         }
                     }
+                    val citationsJson = CitationCodec.encode(event.citations)
                     // 正文为空（只有思考/协议标签）时不落库，也就不索引：
-                    // 没有 assistant 消息就没有可写的 messageId（v0.4）。
-                    val assistantRow = if (finalText.isNotEmpty()) {
-                        updateAssistant(assistantId, finalText)
-                        container.chat.append(
-                            threadId = threadId,
-                            segmentId = segmentId,
-                            role = "assistant",
-                            text = finalText,
-                            tokens = finalText.length / 2 + 4,
-                            emotion = parsed.emotion,
-                            usageIn = event.usage?.promptTokens,
-                            usageOut = event.usage?.completionTokens,
+                    // 没有 assistant 消息就没有可写的 messageId。
+                    if (preservedAssistant != null && finalText.isEmpty()) {
+                        restoreRegeneratedAssistant(
+                            assistantId,
+                            preservedAssistant,
+                            userRow.id,
+                            ChatActionCopy.REGENERATE_EMPTY,
+                            messageActionId,
                         )
+                        return@collect
+                    }
+                    val replacement = if (finalText.isNotEmpty() && !replaceAssistantDbId.isNullOrBlank()) {
+                        // Keep the result of an entered Room transaction available for post-commit
+                        // cleanup. Stop is fenced before mutation; wipe is checked inside the txn.
+                        // Room queues transactions, so a last-moment commit completes before clearAllTables.
+                        // NonCancellable protects only this transaction/result handoff; the callbacks
+                        // still abort on stop/wipe before commit. Keep it as the sole context element
+                        // and switch to IO inside, per Kotlin coroutine guidance.
+                        // Coroutine context documentation: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/with-context.html
+                        withContext(NonCancellable) {
+                            val committed = withContext(Dispatchers.IO) {
+                                container.chat.replaceAssistantReplyWithPropagation(
+                                    threadId = threadId,
+                                    segmentId = segmentId,
+                                    oldMessageId = replaceAssistantDbId,
+                                    text = finalText,
+                                    tokens = finalText.length / 2 + 4,
+                                    emotion = parsed.emotion,
+                                    usageIn = event.usage?.promptTokens,
+                                    usageOut = event.usage?.completionTokens,
+                                    reasoningContent = event.reasoningContent,
+                                    serverToolCallsJson = event.serverToolCallsJson,
+                                    citationsJson = citationsJson,
+                                    canBeginCommit = {
+                                        messageActionFence?.beginCommit {
+                                            !wipeChangedSince(wipeEpoch)
+                                        } ?: true
+                                    },
+                                    canContinue = {
+                                        (messageActionFence?.canContinue() ?: true) &&
+                                            !wipeChangedSince(wipeEpoch)
+                                    },
+                                )
+                            }
+                            messageActionFence?.complete()
+                            committed?.deleted?.let { cleanupCommittedDeletion(it) }
+                            committed
+                        }
                     } else {
                         null
                     }
-                    // 联网搜索的来源只挂在当轮消息上，不落库：换页/重启后丢失可接受
-                    // （v0.2 口径 的来源面板是 Phase 2）。
-                    updateAssistantCitations(assistantId, event.citations)
-                    _state.value = _state.value.copy(
-                        streaming = false,
-                        error = if (event.truncated) "回答到一半断了。已经写出来的还在这里。" else null,
-                        // 降级成功的轻提示：这轮本来想联网，服务端不接受，已按普通回答重发成功。
-                        notice = if (event.webSearchDropped) WEB_SEARCH_FALLBACK_NOTICE else null,
-                    )
-                    // 自动朗读：只读「刚完成的这条」最终回复，流式过程中绝不读。
+                    // The Room write and wipe transaction serialize on the same database. If a
+                    // wipe won after our final in-transaction check, never republish this result
+                    // into the old ViewModel; the wipe clears the committed row after this txn.
+                    if (wipeChangedSince(wipeEpoch)) return@collect
+                    if (preservedAssistant != null && replacement == null) {
+                        restoreRegeneratedAssistant(
+                            assistantId,
+                            preservedAssistant,
+                            userRow.id,
+                            ChatActionCopy.REGENERATE_FAILED,
+                            messageActionId,
+                        )
+                        return@collect
+                    }
+                    if (replacement != null) {
+                        messageActionId?.let(::clearMessageFence)
+                        updateAssistant(assistantId, finalText)
+                        finishAssistantUi(
+                            assistantId = assistantId,
+                            dbId = replacement.message.id,
+                            citations = event.citations,
+                            combinedReasoning = ReasoningRestore.combine(
+                                event.reasoningContent,
+                                event.serverToolCallsJson,
+                            ),
+                        )
+                        _state.value = _state.value.copy(
+                            streaming = false,
+                            error = if (event.truncated) "回答到一半断了。已经写出来的还在这里。" else null,
+                            notice = if (event.webSearchDropped) WEB_SEARCH_FALLBACK_NOTICE else null,
+                        )
+                        clearRegenerationRecovery(messageActionId)
+                        clearActiveMessageStream(messageActionId)
+                    }
+                    val assistantRow = if (finalText.isNotEmpty()) {
+                        if (replacement != null) {
+                            replacement.message
+                        } else {
+                            updateAssistant(assistantId, finalText)
+                            val appendAssistantRow: suspend () -> MessageEntity? = {
+                                withContext(Dispatchers.IO) {
+                                    container.chat.appendAssistantForTurn(
+                                        threadId = threadId,
+                                        segmentId = segmentId,
+                                        text = finalText,
+                                        tokens = finalText.length / 2 + 4,
+                                        emotion = parsed.emotion,
+                                        usageIn = event.usage?.promptTokens,
+                                        usageOut = event.usage?.completionTokens,
+                                        reasoningContent = event.reasoningContent,
+                                        serverToolCallsJson = event.serverToolCallsJson,
+                                        citationsJson = citationsJson,
+                                        canBeginCommit = {
+                                            messageActionFence?.beginCommit {
+                                                !wipeChangedSince(wipeEpoch)
+                                            } ?: !wipeChangedSince(wipeEpoch)
+                                        },
+                                        canContinue = {
+                                            (messageActionFence?.canContinue() ?: true) &&
+                                                !wipeChangedSince(wipeEpoch)
+                                        },
+                                    )
+                                }
+                            }
+                            // A fenced message action keeps the transaction result handoff intact;
+                            // ordinary sends remain cancellable. The in-transaction epoch gate
+                            // decides whether either path may write. NonCancellable is the only
+                            // outer context element, with IO switched inside as Kotlin documents.
+                            // Coroutine context documentation: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/with-context.html
+                            val appended = if (messageActionFence != null) {
+                                withContext(NonCancellable) {
+                                    appendAssistantRow().also { messageActionFence.complete() }
+                                }
+                            } else {
+                                appendAssistantRow()
+                            }
+                            // This check follows the suspending insert. If a wipe changed after the
+                            // last in-transaction gate, its queued clear runs after this Room txn.
+                            if (wipeChangedSince(wipeEpoch) || appended == null) return@collect
+                            appended
+                        }
+                    } else {
+                        null
+                    }
+                    if (replacement == null) {
+                        finishAssistantUi(
+                            assistantId = assistantId,
+                            dbId = assistantRow?.id,
+                            citations = event.citations,
+                            combinedReasoning = ReasoningRestore.combine(
+                                event.reasoningContent,
+                                event.serverToolCallsJson,
+                            ),
+                        )
+                        _state.value = _state.value.copy(
+                            streaming = false,
+                            error = if (event.truncated) "回答到一半断了。已经写出来的还在这里。" else null,
+                            // F2 降级成功的轻提示：这轮本来想联网，服务端不接受，已按普通回答重发成功。
+                            notice = if (event.webSearchDropped) WEB_SEARCH_FALLBACK_NOTICE else null,
+                        )
+                        clearRegenerationRecovery(messageActionId)
+                        clearActiveMessageStream(messageActionId)
+                    }
+                    // 自动朗读只读「刚完成的这条」最终回复，流式过程中不朗读。
                     // 放在正文定稿、危机兜底句追加之后：读到的就是用户看到的全文。
                     maybeAutoRead(finalText)
                     // 记账与后台维护：不阻塞 UI
@@ -2017,28 +3037,509 @@ class ChatViewModel(
                 }
                 is LlmEvent.Failed -> {
                     finished = true
+                    // DeepSeek 可在检查完整输出后才拒绝；终态到达时撤下此前显示的内容。
+                    // DeepSeek refusal handling: https://api-docs.deepseek.com/guides/safety/.
+                    val refusedByDeepSeek = deepSeek && event.error.kind == ApiError.Kind.FILTERED
                     // v0.5 识图：内容被服务商拦下 / 带图+联网搜索 400 → 专属人话；
                     // 其余错误保持 `ErrorCopy` 原来的口径。
-                    val copy = ImageCopy.sendFailureOf(
-                        error = event.error,
-                        hasImages = imageCount > 0,
-                        webSearchOn = request.webSearch,
-                    ) ?: ErrorCopy.of(event.error)
-                    fail(assistantId, copy)
+                    val copy = if (refusedByDeepSeek) {
+                        ImageCopy.FILTERED_REPLY
+                    } else {
+                        ImageCopy.sendFailureOf(
+                            error = event.error,
+                            hasImages = imageCount > 0,
+                            webSearchOn = request.webSearch,
+                        ) ?: ErrorCopy.of(event.error)
+                    }
+                    if (preservedAssistant != null) {
+                        restoreRegeneratedAssistant(assistantId, preservedAssistant, userRow.id, copy, messageActionId)
+                    } else {
+                        fail(
+                            assistantId,
+                            copy,
+                            targetUserDbId = userRow.id,
+                            clearRefusedContent = refusedByDeepSeek,
+                        )
+                    }
+                    clearActiveMessageStream(messageActionId)
                 }
             }
         }
         if (!finished) {
-            _state.value = _state.value.copy(streaming = false)
+            if (preservedAssistant != null) {
+                restoreRegeneratedAssistant(
+                    assistantId,
+                    preservedAssistant,
+                    userRow.id,
+                    ChatActionCopy.REGENERATE_CANCELLED,
+                    messageActionId,
+                )
+            } else {
+                _state.value = _state.value.copy(
+                    streaming = false,
+                    messages = _state.value.messages.map {
+                        if (it.id == assistantId) it.copy(toolProgressText = null) else it
+                    },
+                )
+                clearActiveMessageStream(messageActionId)
+            }
         }
     }
 
+    private fun restoreRegeneratedAssistant(
+        assistantId: String,
+        original: ChatUiMessage,
+        userDbId: String,
+        message: String,
+        actionId: Long? = null,
+    ) {
+        val recovery = regenerationRecovery
+        if (actionId != null && recovery != null && recovery.actionId != actionId) return
+        if (actionId != null && recovery == null && !ownsMessageAction(actionId)) return
+        if (actionId != null) clearMessageFence(actionId)
+        clearRegenerationRecovery(actionId)
+        clearActiveMessageStream(actionId)
+        _state.value = _state.value.copy(
+            streaming = false,
+            error = message,
+            notice = null,
+            messages = _state.value.messages.map {
+                if (it.id == assistantId) {
+                    original.copy(
+                        toolProgressText = null,
+                        targetUserDbId = original.targetUserDbId ?: userDbId,
+                    )
+                } else {
+                    it
+                }
+            },
+        )
+    }
+
+    private fun clearRegenerationRecovery(actionId: Long?) {
+        if (actionId != null && regenerationRecovery?.actionId == actionId) {
+            regenerationRecovery = null
+        }
+    }
+
+    private fun clearActiveMessageStream(actionId: Long?) {
+        if (actionId != null && activeMessageStreamActionId == actionId) {
+            activeMessageStreamActionId = null
+        }
+        if (actionId != null) clearMessageFence(actionId)
+    }
+
+    private fun clearMessageFence(actionId: Long) {
+        if (activeMessageFence?.actionId == actionId) activeMessageFence = null
+    }
+
+    private fun startMessageActionStream(
+        actionId: Long,
+        settings: Settings,
+        userRow: MessageEntity,
+        imageCount: Int,
+        assistant: ChatUiMessage,
+        wipeEpoch: Long,
+        preservedAssistant: ChatUiMessage? = null,
+        replaceAssistantDbId: String? = null,
+    ): Boolean {
+        if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return false
+        val messageActionFence = MessageActionFence().also { fence ->
+            activeMessageFence = ActiveMessageFence(actionId, fence)
+        }
+        if (preservedAssistant != null) {
+            regenerationRecovery = RegenerationRecovery(
+                actionId = actionId,
+                assistantId = assistant.id,
+                original = preservedAssistant,
+                userDbId = userRow.id,
+            )
+        }
+        activeMessageStreamActionId = actionId
+        _state.value = _state.value.copy(
+            streaming = true,
+            error = null,
+            notice = null,
+            messages = _state.value.messages.map {
+                if (it.id == assistant.id) {
+                    it.copy(
+                        text = "",
+                        failed = false,
+                        reasoning = null,
+                        citations = emptyList(),
+                        toolProgressText = null,
+                        targetUserDbId = userRow.id,
+                    )
+                } else {
+                    it
+                }
+            },
+        )
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                executeTurnForUserRow(
+                    settings = settings,
+                    userRow = userRow,
+                    imageCount = imageCount,
+                    assistantId = assistant.id,
+                    threadId = threadId,
+                    wipeEpoch = wipeEpoch,
+                    replaceAssistantDbId = replaceAssistantDbId,
+                    preservedAssistant = preservedAssistant,
+                    messageActionId = actionId,
+                    messageActionFence = messageActionFence,
+                )
+            } catch (cancelled: CancellationException) {
+                if (activeMessageStreamActionId == actionId && preservedAssistant != null &&
+                    regenerationRecovery?.actionId == actionId &&
+                    !wipeChangedSince(wipeEpoch)
+                ) {
+                    restoreRegeneratedAssistant(
+                        assistant.id,
+                        preservedAssistant,
+                        userRow.id,
+                        ChatActionCopy.REGENERATE_CANCELLED,
+                        actionId,
+                    )
+                } else if (activeMessageStreamActionId == actionId && !wipeChangedSince(wipeEpoch)) {
+                    _state.value = _state.value.copy(streaming = false)
+                }
+                throw cancelled
+            } catch (_: Throwable) {
+                if (activeMessageStreamActionId == actionId && !wipeChangedSince(wipeEpoch)) {
+                    if (preservedAssistant != null && regenerationRecovery?.actionId == actionId) {
+                        restoreRegeneratedAssistant(
+                            assistant.id,
+                            preservedAssistant,
+                            userRow.id,
+                            ChatActionCopy.REGENERATE_FAILED,
+                            actionId,
+                        )
+                    } else if (_state.value.streaming) {
+                        fail(assistant.id, ChatActionCopy.RETRY_FAILED, targetUserDbId = userRow.id)
+                    }
+                }
+            } finally {
+                if (activeMessageStreamActionId == actionId) activeMessageStreamActionId = null
+                clearMessageFence(actionId)
+            }
+        }
+        streamJob = job
+        if (!transferMessageActionToStream(actionId)) {
+            messageActionFence?.cancelBeforeCommit()
+            clearMessageFence(actionId)
+            clearRegenerationRecovery(actionId)
+            clearActiveMessageStream(actionId)
+            job.cancel()
+            return false
+        }
+        job.start()
+        return true
+    }
+
+    private suspend fun cleanupCommittedDeletion(deletion: cc.pulsez.app.data.repo.ChatRepository.MessagePropagationDelete) {
+        withContext(NonCancellable + Dispatchers.IO) {
+            deletion.localPaths.forEach { path -> runCatching { container.attachmentStore.delete(path) } }
+        }
+        if (deletion.remoteFileIds.isNotEmpty()) {
+            // ChatRepository enqueues these IDs inside the same Room transaction as the soft delete.
+            // The coordinator chooses a matching credential binding and rechecks live references before DELETE.
+            container.remoteFileCleanupCoordinator.requestRetry()
+        }
+    }
+
+    /**
+     * 失败占位原地重试：不追加新的用户消息，复用原 [userRow] 及其 `latestReminder`。
+     */
+    fun retryMessage(messageId: String) {
+        val snapshot = _state.value
+        if (threadId.isEmpty()) return
+        val targetIdx = snapshot.messages.indexOfFirst { it.id == messageId || it.dbId == messageId }
+        if (targetIdx < 0) return
+        val target = snapshot.messages[targetIdx]
+        if (!target.failed) return
+        val userDbId = resolveTargetUserDbId(snapshot.messages, targetIdx, target)
+        if (userDbId.isNullOrBlank()) {
+            _state.value = snapshot.copy(error = ChatActionCopy.RETRY_MISSING_USER)
+            return
+        }
+        val actionId = reserveMessageAction(snapshot) ?: return
+        val wipeEpoch = container.wipeEpoch.value
+        container.reader.stop()
+        launchMessageAction(actionId, onFailure = {
+            _state.value = _state.value.copy(error = ChatActionCopy.RETRY_FAILED)
+        }) {
+            val userRow = withContext(Dispatchers.IO) {
+                container.database.messageDao().byId(userDbId)?.takeIf {
+                    it.deletedAt == null && it.role == "user"
+                }
+            }
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            if (userRow == null) {
+                _state.value = _state.value.copy(error = ChatActionCopy.RETRY_MISSING_USER)
+                return@launchMessageAction
+            }
+            val settings = container.settings.flow.first()
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            val imageCount = withContext(Dispatchers.IO) {
+                runCatching {
+                    container.attachments.listForMessage(userRow.id).count { it.kind == AttachmentKind.IMAGE }
+                }.getOrDefault(0)
+            }
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            val firstLimit = usageLimitMessage(settings)
+            if (firstLimit != null) {
+                _state.value = _state.value.copy(error = firstLimit)
+                return@launchMessageAction
+            }
+            if (imageCount > 0) {
+                val imageLimit = usageLimitMessage(settings)
+                if (imageLimit != null) {
+                    _state.value = _state.value.copy(error = imageLimit)
+                    return@launchMessageAction
+                }
+            }
+            startMessageActionStream(
+                actionId = actionId,
+                settings = settings,
+                userRow = userRow,
+                imageCount = imageCount,
+                assistant = target,
+                wipeEpoch = wipeEpoch,
+            )
+        }
+    }
+
+    /**
+     * 重新生成最后一条助手回复：先保留旧回复；新回复落库时再原子替换旧行及其派生数据。
+     */
+    fun regenerateMessage(messageId: String) {
+        val snapshot = _state.value
+        if (threadId.isEmpty()) return
+        val targetIdx = snapshot.messages.indexOfFirst { it.id == messageId || it.dbId == messageId }
+        if (targetIdx < 0) return
+        val target = snapshot.messages[targetIdx]
+        if (!ChatMessageActions.canRegenerate(snapshot.messages, target, snapshot.streaming, snapshot.isAwakening)) {
+            return
+        }
+        if (target.failed) {
+            retryMessage(target.id)
+            return
+        }
+        val userDbId = resolveTargetUserDbId(snapshot.messages, targetIdx, target)
+        if (userDbId.isNullOrBlank()) {
+            _state.value = snapshot.copy(error = ChatActionCopy.RETRY_MISSING_USER)
+            return
+        }
+        val actionId = reserveMessageAction(snapshot) ?: return
+        val oldAssistantDbId = effectiveDbId(target)
+        val wipeEpoch = container.wipeEpoch.value
+        container.reader.stop()
+        launchMessageAction(actionId, onFailure = {
+            restoreRegeneratedAssistant(
+                target.id,
+                target,
+                userDbId,
+                ChatActionCopy.REGENERATE_FAILED,
+                actionId,
+            )
+        }) {
+            val userRow = withContext(Dispatchers.IO) {
+                container.database.messageDao().byId(userDbId)?.takeIf {
+                    it.deletedAt == null && it.role == "user"
+                }
+            }
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            if (userRow == null) {
+                _state.value = _state.value.copy(error = ChatActionCopy.RETRY_MISSING_USER)
+                return@launchMessageAction
+            }
+            val settings = container.settings.flow.first()
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            val imageCount = withContext(Dispatchers.IO) {
+                runCatching {
+                    container.attachments.listForMessage(userRow.id).count { it.kind == AttachmentKind.IMAGE }
+                }.getOrDefault(0)
+            }
+            if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+            val firstLimit = usageLimitMessage(settings)
+            if (firstLimit != null) {
+                restoreRegeneratedAssistant(target.id, target, userRow.id, firstLimit, actionId)
+                return@launchMessageAction
+            }
+            if (imageCount > 0) {
+                val imageLimit = usageLimitMessage(settings)
+                if (imageLimit != null) {
+                    restoreRegeneratedAssistant(target.id, target, userRow.id, imageLimit, actionId)
+                    return@launchMessageAction
+                }
+            }
+            startMessageActionStream(
+                actionId = actionId,
+                settings = settings,
+                userRow = userRow,
+                imageCount = imageCount,
+                assistant = target,
+                wipeEpoch = wipeEpoch,
+                preservedAssistant = target.takeIf { oldAssistantDbId != null },
+                replaceAssistantDbId = oldAssistantDbId,
+            )
+        }
+    }
+
+    /**
+     * 单条软删消息并传播到 chunk / chunk_term / memory_item / attachment，清理本地文件并 best-effort 删远端文件。
+     */
+    fun deleteMessage(messageId: String) {
+        val snapshot = _state.value
+        if (threadId.isEmpty()) return
+        val target = snapshot.messages.firstOrNull { it.id == messageId || it.dbId == messageId } ?: return
+        val dbId = effectiveDbId(target)
+        if (dbId == null) {
+            // Local optimistic rows have no DB transaction to protect them. Keep the same
+            // synchronous busy gate as persisted message actions so a live send cannot lose its
+            // bubble while its append/attachment binding is still in flight.
+            if (snapshot.isAwakening || snapshot.streaming || snapshot.uploadingFiles ||
+                activeSendAttempt != null || activeUserAppendFence != null ||
+                activeMessageActionId != null || activeMessageStreamActionId != null
+            ) return
+            _state.value = snapshot.copy(
+                messages = snapshot.messages.filterNot { it.id == target.id },
+                notice = null,
+            )
+            return
+        }
+        val actionId = reserveMessageAction(snapshot) ?: return
+        val wipeEpoch = container.wipeEpoch.value
+        val fence = MessageActionFence()
+        activeMessageFence = ActiveMessageFence(actionId, fence)
+        container.reader.stop()
+        launchMessageAction(actionId, onFailure = {
+            _state.value = _state.value.copy(error = ChatActionCopy.DELETE_FAILED)
+        }) {
+            try {
+                if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+                // Match regeneration's fenced transaction/result handoff; never publish UI after a wipe.
+                val committed = withContext(NonCancellable) {
+                    val deletion = withContext(Dispatchers.IO) {
+                        container.chat.softDeleteMessageWithPropagation(
+                            threadId = threadId,
+                            messageId = dbId,
+                            canBeginCommit = { fence.beginCommit { !wipeChangedSince(wipeEpoch) } },
+                            canContinue = { fence.canContinue() && !wipeChangedSince(wipeEpoch) },
+                        )
+                    }
+                    fence.complete()
+                    if (deletion.deleted) cleanupCommittedDeletion(deletion)
+                    deletion
+                }
+                // A wipe may follow the committed delete before this continuation resumes. The
+                // write is durable, but the old ViewModel must not publish stale state afterward.
+                if (!ownsMessageAction(actionId) || wipeChangedSince(wipeEpoch)) return@launchMessageAction
+                if (!committed.deleted) {
+                    _state.value = _state.value.copy(error = ChatActionCopy.DELETE_FAILED)
+                    return@launchMessageAction
+                }
+                _state.value = _state.value.copy(
+                    messages = _state.value.messages.filterNot {
+                        it.id == target.id || (it.dbId != null && it.dbId == dbId)
+                    }.map {
+                        if (it.targetUserDbId == dbId) it.copy(targetUserDbId = null) else it
+                    },
+                    error = null,
+                    notice = null,
+                )
+            } finally {
+                fence.complete()
+                clearMessageFence(actionId)
+            }
+        }
+    }
+
+    private fun resolveTargetUserDbId(
+        messages: List<ChatUiMessage>,
+        targetIdx: Int,
+        target: ChatUiMessage,
+    ): String? {
+        target.targetUserDbId?.takeIf { it.isNotBlank() }?.let { return it }
+        for (i in (targetIdx - 1) downTo 0) {
+            val candidate = messages[i]
+            if (candidate.role == "user") {
+                return effectiveDbId(candidate)
+            }
+        }
+        return null
+    }
+
+    private fun effectiveDbId(message: ChatUiMessage): String? {
+        message.dbId?.takeIf { it.isNotBlank() }?.let { return it }
+        if (message.failed || message.id.startsWith("local-")) return null
+        return message.id.takeIf { it.isNotBlank() }
+    }
+
+    private fun attachPersistedUserIds(
+        userLocalId: String,
+        userDbId: String,
+        assistantId: String,
+    ) {
+        _state.value = _state.value.copy(
+            messages = _state.value.messages.map {
+                when (it.id) {
+                    userLocalId -> it.copy(dbId = userDbId)
+                    assistantId -> it.copy(targetUserDbId = userDbId)
+                    else -> it
+                }
+            },
+        )
+    }
+
     fun stop() {
+        cancelPendingFileSendAttempt(showUnconfirmedNotice = true)
+        val userAppend = activeUserAppendFence
+        if (userAppend != null) {
+            if (userAppend.fence.cancelBeforeCommit()) {
+                if (activeUserAppendFence?.attemptId == userAppend.attemptId) {
+                    activeUserAppendFence = null
+                }
+            } else if (userAppend.fence.isCommitting()) {
+                // The row transaction owns its commit boundary. Let it finish, synchronize the
+                // local bubble's DB id, then stop before preparing or sending a model request.
+                userAppend.stopAfterCommit.set(true)
+                _state.value = _state.value.copy(streaming = false)
+                container.reader.stop()
+                return
+            }
+        }
+        val fence = activeMessageFence
+        if (fence != null && !fence.fence.cancelBeforeCommit()) {
+            // The transaction already owns the commit boundary; let it finish and publish its result.
+            container.reader.stop()
+            return
+        }
+        if (fence != null) clearMessageFence(fence.actionId)
         invalidateSendAttempt()
+        cancelPendingMessageAction()
+        activeMessageStreamActionId = null
         streamJob?.cancel()
         streamJob = null
-        _state.value = _state.value.copy(streaming = false)
-        // 停止生成 → 停读（停止条件）。
+        val recovery = regenerationRecovery
+        if (recovery != null) {
+            restoreRegeneratedAssistant(
+                recovery.assistantId,
+                recovery.original,
+                recovery.userDbId,
+                ChatActionCopy.REGENERATE_CANCELLED,
+                recovery.actionId,
+            )
+        } else {
+            _state.value = _state.value.copy(
+                streaming = false,
+                messages = _state.value.messages.map {
+                    if (it.toolProgressText != null) it.copy(toolProgressText = null) else it
+                },
+            )
+        }
+        // 停止生成时停止朗读。
         container.reader.stop()
     }
 
@@ -2053,7 +3554,19 @@ class ChatViewModel(
      * v0.5 识图：顺手清掉缩略图内存缓存（页面销毁释放；`ThumbnailCache` 另有 onTrimMemory）。
      */
     override fun onCleared() {
+        filePickerGeneration += 1L
+        cancelPendingFileSendAttempt(showUnconfirmedNotice = false)
         invalidateSendAttempt()
+        sendPreparationJob?.cancel()
+        sendPreparationJob = null
+        sendPreparationJobOwnerId = null
+        cancelPendingMessageAction()
+        activeMessageFence?.fence?.cancelBeforeCommit()
+        activeMessageFence = null
+        activeMessageStreamActionId = null
+        regenerationRecovery = null
+        streamJob?.cancel()
+        streamJob = null
         container.reader.stop()
         container.reader.shutdown()
         cc.pulsez.app.media.ThumbnailCache.evictAll()
@@ -2077,25 +3590,55 @@ class ChatViewModel(
         container.reader.stop()
     }
 
+    private data class LiveMessageAttachments(
+        val imagePaths: Map<String, List<String>> = emptyMap(),
+        val fileNames: Map<String, List<String>> = emptyMap(),
+    )
+
     /**
-     * 读消息 → 本地缩略图路径（v0.5 识图；只含活附件、排除失败态）。
+     * 读消息 → 本地图片路径与普通文件名（只含活附件、排除失败态）。
      *
-     * 刻意**不**在这里过滤"文件是否还在"：文件被清/丢失时要把路径交给 UI，
-     * 让缩略图位显示「图片已删除」占位（研究 §2.3.4）——直接过滤会让纯图消息变成空气泡。
+     * 图片刻意**不**在这里过滤"文件是否还在"：文件被清/丢失时要把路径交给 UI，
+     * 让缩略图位显示「图片已删除」占位。
      */
-    private suspend fun imagePathsByMessage(): Map<String, List<String>> = withContext(Dispatchers.IO) {
+    private suspend fun liveMessageAttachments(): LiveMessageAttachments = withContext(Dispatchers.IO) {
         runCatching {
-            container.database.attachmentDao().allLive()
-                .filter {
-                    it.kind == AttachmentKind.IMAGE &&
-                        !it.messageId.isNullOrBlank() &&
-                        it.status != AttachmentStatus.FAILED &&
-                        it.localPath.isNotBlank()
+            val rows = container.database.attachmentDao().allLive()
+                .filter { !it.messageId.isNullOrBlank() && it.status != AttachmentStatus.FAILED }
+            val images = mutableMapOf<String, MutableList<String>>()
+            val files = mutableMapOf<String, MutableList<String>>()
+            rows.forEach { row ->
+                val messageId = row.messageId ?: return@forEach
+                when (row.kind) {
+                    AttachmentKind.IMAGE -> if (row.localPath.isNotBlank()) {
+                        images.getOrPut(messageId) { mutableListOf() }.add(row.localPath)
+                    }
+                    AttachmentKind.FILE -> {
+                        val name = row.fileName?.takeIf { it.isNotBlank() } ?: "文件"
+                        files.getOrPut(messageId) { mutableListOf() }.add(name)
+                    }
                 }
-                .groupBy { it.messageId.orEmpty() }
-                .mapValues { (_, rows) -> rows.map { it.localPath } }
-        }.getOrDefault(emptyMap())
+            }
+            LiveMessageAttachments(imagePaths = images, fileNames = files)
+        }.getOrDefault(LiveMessageAttachments())
     }
+
+    private fun MessageEntity.toUiMessage(
+        attachments: LiveMessageAttachments,
+        importSource: ImportSourceSessionEntity?,
+    ): ChatUiMessage = ChatUiMessage(
+        id = id,
+        dbId = id,
+        role = role,
+        text = content,
+        reasoning = ReasoningRestore.combine(reasoningContent, serverToolCallsJson),
+        citations = CitationCodec.decode(citationsJson),
+        imagePaths = attachments.imagePaths[id].orEmpty(),
+        fileNames = attachments.fileNames[id].orEmpty(),
+        sourceSessionId = importSource?.sourceSessionId,
+        sourceTitle = importSource?.title,
+        sourceStartedAt = importSource?.sourceStartedAt,
+    )
 
     /**
      * 自动朗读一条刚完成的回复（v0.5）。
@@ -2128,13 +3671,15 @@ class ChatViewModel(
 
     private fun updateAssistant(id: String, text: String) {
         _state.value = _state.value.copy(
-            messages = _state.value.messages.map { if (it.id == id) it.copy(text = text) else it },
+            messages = _state.value.messages.map {
+                if (it.id == id) it.copy(text = text, toolProgressText = null) else it
+            },
         )
     }
 
     /**
-     * 思考增量：只更新消息的 reasoning 字段，绝不进正文，也不落库
-     * （不带 tools 时 reasoning_content 不用回传；UI 折叠展示）。
+     * 思考增量：只更新消息的 reasoning 字段，绝不进正文
+     * UI 显示为可折叠内容，并在生成完成时与正文一起保存。
      */
     private fun updateAssistantReasoning(id: String, reasoning: String) {
         _state.value = _state.value.copy(
@@ -2142,21 +3687,61 @@ class ChatViewModel(
         )
     }
 
-    /** 联网搜索来源：只在当轮消息上展示，不落库（v0.2 口径）。*/
-    private fun updateAssistantCitations(id: String, citations: List<Citation>) {
-        if (citations.isEmpty()) return
+    private fun updateAssistantToolProgress(id: String, progressText: String) {
         _state.value = _state.value.copy(
-            messages = _state.value.messages.map { if (it.id == id) it.copy(citations = citations) else it },
+            messages = _state.value.messages.map {
+                if (it.id == id) it.copy(toolProgressText = progressText) else it
+            },
         )
     }
 
-    private fun fail(assistantId: String, message: String) {
+    private fun finishAssistantUi(
+        assistantId: String,
+        dbId: String?,
+        citations: List<Citation>,
+        combinedReasoning: String?,
+    ) {
+        _state.value = _state.value.copy(
+            messages = _state.value.messages.map {
+                if (it.id == assistantId) {
+                    it.copy(
+                        dbId = dbId ?: it.dbId,
+                        citations = if (citations.isNotEmpty()) citations else it.citations,
+                        reasoning = combinedReasoning ?: it.reasoning,
+                        toolProgressText = null,
+                    )
+                } else {
+                    it
+                }
+            },
+        )
+    }
+
+    private fun fail(
+        assistantId: String,
+        message: String,
+        targetUserDbId: String? = null,
+        clearRefusedContent: Boolean = false,
+    ) {
         _state.value = _state.value.copy(
             streaming = false,
             error = message,
             notice = null,
             messages = _state.value.messages.map {
-                if (it.id == assistantId) it.copy(text = REPLY_FAILED_PLACEHOLDER, failed = true) else it
+                if (it.id == assistantId) {
+                    if (clearRefusedContent) {
+                        refusedMessageState(it, targetUserDbId)
+                    } else {
+                        it.copy(
+                            text = REPLY_FAILED_PLACEHOLDER,
+                            failed = true,
+                            toolProgressText = null,
+                            targetUserDbId = targetUserDbId ?: it.targetUserDbId,
+                        )
+                    }
+                } else {
+                    it
+                }
             },
         )
     }
@@ -2222,6 +3807,20 @@ class ChatViewModel(
          */
         internal const val REPLY_FAILED_PLACEHOLDER = "TA 没回上来。"
 
+        /** DeepSeek 终态拒绝时丢弃流式前缀和所有随正文展示的派生内容。 */
+        internal fun refusedMessageState(
+            message: ChatUiMessage,
+            targetUserDbId: String? = null,
+        ): ChatUiMessage = message.copy(
+            dbId = null,
+            text = REPLY_FAILED_PLACEHOLDER,
+            failed = true,
+            reasoning = null,
+            citations = emptyList(),
+            toolProgressText = null,
+            targetUserDbId = targetUserDbId ?: message.targetUserDbId,
+        )
+
         internal const val ENTER_CREATIVE_MODE_NOTICE = "进入创作模式了。"
 
         /**
@@ -2232,9 +3831,95 @@ class ChatViewModel(
          */
         internal const val EXIT_CREATIVE_MODE_NOTICE = "回到平常聊天了。"
 
+        private val URL_REGEX = Regex("https?://", RegexOption.IGNORE_CASE)
+
+        internal fun shouldEnableReadUrl(
+            deepSeek: Boolean,
+            webSearchEnabled: Boolean,
+            userText: String,
+        ): Boolean = deepSeek && (webSearchEnabled || URL_REGEX.containsMatchIn(userText))
+
         fun factory(container: AppContainer, characterId: String): ViewModelProvider.Factory =
             viewModelFactory {
                 initializer { ChatViewModel(container, characterId) }
             }
+    }
+}
+
+internal object CitationCodec {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        explicitNulls = false
+    }
+
+    fun encode(citations: List<Citation>): String? {
+        if (citations.isEmpty()) return null
+        val array = buildJsonArray {
+            citations.forEach { citation ->
+                if (citation.url.isBlank()) return@forEach
+                add(
+                    buildJsonObject {
+                        put("url", citation.url)
+                        citation.title?.takeIf { it.isNotBlank() }?.let { put("title", it) }
+                        citation.startIndex?.let { put("startIndex", it) }
+                        citation.endIndex?.let { put("endIndex", it) }
+                    },
+                )
+            }
+        }
+        return array.takeIf { it.isNotEmpty() }?.toString()
+    }
+
+    fun decode(rawJson: String?): List<Citation> {
+        if (rawJson.isNullOrBlank()) return emptyList()
+        val array = runCatching { json.parseToJsonElement(rawJson) as? JsonArray }.getOrNull()
+            ?: return emptyList()
+        return array.mapNotNull { element ->
+            val obj = element as? JsonObject ?: return@mapNotNull null
+            val url = (obj["url"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+            val title = (obj["title"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+            val startIndex = ((obj["startIndex"] ?: obj["start_index"]) as? JsonPrimitive)?.intOrNull
+                ?.takeIf { it >= 0 }
+            val endIndex = ((obj["endIndex"] ?: obj["end_index"]) as? JsonPrimitive)?.intOrNull
+                ?.takeIf { it >= 0 }
+            Citation(
+                url = url,
+                title = title,
+                startIndex = startIndex,
+                endIndex = endIndex,
+            )
+        }
+    }
+}
+
+internal object ReasoningRestore {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        explicitNulls = false
+    }
+
+    fun combine(reasoningContent: String?, serverToolCallsJson: String?): String? {
+        val parts = mutableListOf<String>()
+        if (!serverToolCallsJson.isNullOrBlank()) {
+            val array = runCatching { json.parseToJsonElement(serverToolCallsJson) as? JsonArray }.getOrNull()
+            array?.forEach { element ->
+                val obj = element as? JsonObject ?: return@forEach
+                val stepReasoning = ((obj["reasoning_content"] ?: obj["reasoning"]) as? JsonPrimitive)
+                    ?.contentOrNull
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                if (stepReasoning != null && stepReasoning !in parts) {
+                    parts.add(stepReasoning)
+                }
+            }
+        }
+        val finalPart = reasoningContent?.trim()?.takeIf { it.isNotEmpty() }
+        if (finalPart != null && parts.lastOrNull() != finalPart) {
+            parts.add(finalPart)
+        }
+        return parts.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
     }
 }

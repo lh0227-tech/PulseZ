@@ -6,14 +6,22 @@ package cc.pulsez.app.mem
  * 对应文档：03 §3.1（Prompt 五段布局）、02 §3（message 表）。
  * 本模块是纯 Kotlin/JVM，不依赖 Android 与 Room，因此只保留组装、估算、抽取所需的字段。
  *
- * @property role 角色，取 [ROLE_SYSTEM] / [ROLE_USER] / [ROLE_ASSISTANT]
+ * @property role 角色，取 [ROLE_SYSTEM] / [ROLE_USER] / [ROLE_ASSISTANT] / [ROLE_LATEST_REMINDER]
  * @property content 消息正文
  * @property createdAt 创建时间（epochMillis，0 表示未知）
+ * @property sourceId 对应持久层 `MessageEntity.id`（可选，供调用方精准挂载多模态附件，脱离下标猜测）
+ * @property reasoningContent DeepSeek 历史助手轮思考链内容（可选，仅 DeepSeek 端点回传）
+ * @property serverToolCallsJson DeepSeek 历史助手轮服务端工具调用 JSON 数组串（可选，仅 DeepSeek 端点回传）
+ * @property latestReminder DeepSeek 历史用户轮对应的 `latest_reminder` 文本（可选，仅 DeepSeek 端点回传）
  */
 data class MemMessage(
     val role: String,
     val content: String,
     val createdAt: Long = 0L,
+    val sourceId: String? = null,
+    val reasoningContent: String? = null,
+    val serverToolCallsJson: String? = null,
+    val latestReminder: String? = null,
 ) {
     companion object {
         /** system 消息的 role 常量。 */
@@ -25,17 +33,46 @@ data class MemMessage(
         /** assistant 消息的 role 常量。 */
         const val ROLE_ASSISTANT: String = "assistant"
 
+        /** DeepSeek 场景感知消息的 role 常量（紧贴 user 消息正前方）。 */
+        const val ROLE_LATEST_REMINDER: String = "latest_reminder"
+
         /** 构造一条 system 消息（对应 03 §3.1 的 ①②④ 段）。 */
         fun system(content: String, createdAt: Long = 0L): MemMessage =
             MemMessage(ROLE_SYSTEM, content, createdAt)
 
         /** 构造一条 user 消息（对应 03 §3.1 的 ③⑤ 段）。 */
-        fun user(content: String, createdAt: Long = 0L): MemMessage =
-            MemMessage(ROLE_USER, content, createdAt)
+        fun user(
+            content: String,
+            createdAt: Long = 0L,
+            sourceId: String? = null,
+            latestReminder: String? = null,
+        ): MemMessage = MemMessage(
+            role = ROLE_USER,
+            content = content,
+            createdAt = createdAt,
+            sourceId = sourceId,
+            latestReminder = latestReminder,
+        )
 
         /** 构造一条 assistant 消息（对应 03 §3.1 的 ③ 段）。 */
-        fun assistant(content: String, createdAt: Long = 0L): MemMessage =
-            MemMessage(ROLE_ASSISTANT, content, createdAt)
+        fun assistant(
+            content: String,
+            createdAt: Long = 0L,
+            sourceId: String? = null,
+            reasoningContent: String? = null,
+            serverToolCallsJson: String? = null,
+        ): MemMessage = MemMessage(
+            role = ROLE_ASSISTANT,
+            content = content,
+            createdAt = createdAt,
+            sourceId = sourceId,
+            reasoningContent = reasoningContent,
+            serverToolCallsJson = serverToolCallsJson,
+        )
+
+        /** 构造一条 latest_reminder 消息（DeepSeek 官方场景感知标记）。 */
+        fun latestReminder(content: String, createdAt: Long = 0L): MemMessage =
+            MemMessage(ROLE_LATEST_REMINDER, content, createdAt)
     }
 }
 

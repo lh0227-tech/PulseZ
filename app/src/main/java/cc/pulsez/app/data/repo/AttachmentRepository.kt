@@ -33,6 +33,8 @@ import kotlinx.coroutines.withContext
  */
 class AttachmentRepository(private val db: PulsezDatabase) {
 
+    private val remoteFileCleanup = RemoteFileCleanupRepository(db)
+
     /**
      * 从流建草稿附件：文件落盘 → 写 `status=DRAFT、messageId=null` 的行。
      *
@@ -89,6 +91,63 @@ class AttachmentRepository(private val db: PulsezDatabase) {
             throw AttachmentException(AttachmentErrorCodes.DB, "附件记录写入失败", t)
         }
         return entity
+    }
+
+    /**
+     * 从文件流建通用文件草稿（`kind = AttachmentKind.FILE`，跳过图片宽高校验）。
+     */
+    suspend fun createFileDraft(
+        store: AttachmentStore,
+        mime: String,
+        stream: InputStream,
+        fileName: String?,
+        maxBytes: Long = DEFAULT_FILE_MAX_BYTES,
+        id: String = Ids.new(),
+        createdAt: Long = System.currentTimeMillis(),
+        ownerThreadId: String? = null,
+    ): AttachmentEntity {
+        requireDraftArgs(kind = AttachmentKind.FILE, mime = mime, width = null, height = null)
+        val ext = extForFile(fileName, mime)
+        val localPath = withContext(Dispatchers.IO) {
+            store.save(stream, id, ext, maxBytes)
+        }
+        val entity = AttachmentEntity(
+            id = id,
+            messageId = null,
+            kind = AttachmentKind.FILE,
+            mime = mime,
+            localPath = localPath,
+            fileName = fileName?.trim()?.takeIf { it.isNotEmpty() },
+            sizeBytes = withContext(Dispatchers.IO) { store.sizeOf(localPath) },
+            width = null,
+            height = null,
+            status = AttachmentStatus.DRAFT,
+            errorKind = null,
+            attempts = 0,
+            remoteFileId = null,
+            expiresAt = null,
+            deletedAt = null,
+            createdAt = createdAt,
+            ownerThreadId = ownerThreadId,
+        )
+        try {
+            db.attachmentDao().upsert(entity)
+        } catch (t: Throwable) {
+            withContext(Dispatchers.IO) { runCatching { store.delete(localPath) } }
+            throw AttachmentException(AttachmentErrorCodes.DB, "附件记录写入失败", t)
+        }
+        return entity
+    }
+
+    /** 回写服务端文件句柄与过期时间。 */
+    suspend fun setRemoteFile(
+        id: String,
+        remoteFileId: String?,
+        expiresAt: Long?,
+        remoteCredentialBindingId: String? = null,
+    ): Int {
+        if (id.isBlank()) return 0
+        return db.attachmentDao().updateRemoteFile(id, remoteFileId, expiresAt, remoteCredentialBindingId)
     }
 
     /**
@@ -176,9 +235,16 @@ class AttachmentRepository(private val db: PulsezDatabase) {
      */
     suspend fun discardDraft(id: String, store: AttachmentStore): Boolean {
         if (id.isBlank()) return false
-        val row = db.attachmentDao().byId(id) ?: return false
-        val updated = db.attachmentDao().softDeleteById(id, System.currentTimeMillis())
-        if (updated == 0) return false
+        val row = db.withTransaction {
+            val existing = db.attachmentDao().byId(id) ?: return@withTransaction null
+            val updated = db.attachmentDao().softDeleteById(id, System.currentTimeMillis())
+            if (updated == 0) return@withTransaction null
+            remoteFileCleanup.enqueueInCurrentTransaction(
+                existing.remoteFileId,
+                existing.remoteCredentialBindingId,
+            )
+            existing
+        } ?: return false
         withContext(Dispatchers.IO) { runCatching { store.delete(row.localPath) } }
         return true
     }
@@ -203,8 +269,13 @@ class AttachmentRepository(private val db: PulsezDatabase) {
         if (messageId.isBlank()) return emptyList()
         return db.withTransaction {
             val rows = db.attachmentDao().byMessageId(messageId)
-            if (rows.isNotEmpty()) {
-                db.attachmentDao().softDeleteByMessageId(messageId, now)
+            if (rows.isNotEmpty() && db.attachmentDao().softDeleteByMessageId(messageId, now) > 0) {
+                rows.forEach { row ->
+                    remoteFileCleanup.enqueueInCurrentTransaction(
+                        row.remoteFileId,
+                        row.remoteCredentialBindingId,
+                    )
+                }
             }
             rows.map { it.localPath }
         }
@@ -221,7 +292,19 @@ class AttachmentRepository(private val db: PulsezDatabase) {
      */
     suspend fun clearAll(store: AttachmentStore): Int {
         val now = System.currentTimeMillis()
-        val softDeleted = db.attachmentDao().softDeleteAll(now)
+        val softDeleted = db.withTransaction {
+            val remoteFiles = db.attachmentDao().liveRemoteFileReferences()
+            val count = db.attachmentDao().softDeleteAll(now)
+            if (count > 0) {
+                remoteFiles.forEach { row ->
+                    remoteFileCleanup.enqueueInCurrentTransaction(
+                        row.remoteFileId,
+                        row.remoteCredentialBindingId,
+                    )
+                }
+            }
+            count
+        }
         withContext(Dispatchers.IO) { store.clearAll() }
         return softDeleted
     }
@@ -285,9 +368,18 @@ class AttachmentRepository(private val db: PulsezDatabase) {
         val candidates = db.attachmentDao().staleUnboundDrafts(cutoff)
         if (candidates.isEmpty()) return 0
         val softDeleted = db.withTransaction {
-            candidates.mapNotNull { row ->
-                val updated = db.attachmentDao().softDeleteStaleUnboundDraft(row.id, now, cutoff)
-                if (updated > 0) row.localPath else null
+            buildList {
+                candidates.forEach { row ->
+                    val current = db.attachmentDao().byId(row.id) ?: return@forEach
+                    val updated = db.attachmentDao().softDeleteStaleUnboundDraft(row.id, now, cutoff)
+                    if (updated > 0) {
+                        remoteFileCleanup.enqueueInCurrentTransaction(
+                            current.remoteFileId,
+                            current.remoteCredentialBindingId,
+                        )
+                        add(current.localPath)
+                    }
+                }
             }
         }
         if (softDeleted.isEmpty()) return 0
@@ -307,6 +399,11 @@ class AttachmentRepository(private val db: PulsezDatabase) {
          * 与 `ImagePipeline.TEMP_TTL_MS` / `PulsezApp` 的导入残留清理同为 24h，口径一致。
          */
         const val STALE_DRAFT_TTL_MS: Long = 24 * 60 * 60 * 1000L
+
+        /** 文档文件本地草稿默认体积上限：100 MiB（与服务端 document_parsing 上限对齐）。 */
+        const val DEFAULT_FILE_MAX_BYTES: Long = 100L * 1024 * 1024
+
+        private val FILE_EXT_PATTERN = Regex("[a-z0-9]{1,8}")
     }
 
     // ---------------------------------------------------------------- 内部
@@ -321,6 +418,15 @@ class AttachmentRepository(private val db: PulsezDatabase) {
         if ((width != null && width <= 0) || (height != null && height <= 0)) {
             throw AttachmentException(AttachmentErrorCodes.INVALID_ARGUMENT, "附件尺寸不合法")
         }
+    }
+
+    private fun extForFile(fileName: String?, mime: String): String {
+        val fromName = fileName?.trim()
+            ?.takeIf { '.' in it }
+            ?.substringAfterLast('.')
+            ?.lowercase()
+            ?.takeIf { FILE_EXT_PATTERN.matches(it) }
+        return fromName ?: extForMime(mime)
     }
 
     /**

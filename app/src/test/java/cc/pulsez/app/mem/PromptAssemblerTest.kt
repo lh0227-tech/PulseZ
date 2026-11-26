@@ -46,7 +46,7 @@ class PromptAssemblerTest {
             MemMessage.assistant("在的，怎么啦", baseTime + 1_000L),
         ),
         memory = sampleMemory(),
-        recall = "【你们过去聊过，以下是原文摘录。】\n(11-18) 她说：周五要去面试，有点紧张。",
+        recall = "【你们过去聊过，以下是原文摘录。】\n(11-18) 她说：周五要去面试，有点紧张，准备再复习一遍作品集和设计项目细节，希望一切顺利。",
         userMessage = "你还记得我那个面试吗？",
         budget = 300_000,
     )
@@ -57,18 +57,21 @@ class PromptAssemblerTest {
         val messages = PromptAssembler.assemble(input)
         assertEquals(6, messages.size)
 
-        // ① 协议层 + 人设层 + 语气样本
+        // ① 协议层 + 人设层 + 语气样本（默认不再输出 [[pz:emo=...]]）
         assertEquals(MemMessage.ROLE_SYSTEM, messages[0].role)
-        assertTrue(messages[0].content.contains("[[pz:emo="))
-        assertTrue(messages[0].content.contains("|rel="))
+        assertFalse(messages[0].content.contains("[[pz:"))
         assertTrue(messages[0].content.contains("人设"))
         assertTrue(messages[0].content.contains("语气样本"))
         assertTrue(messages[0].content.indexOf("输出协议") < messages[0].content.indexOf("【人设】"))
 
-        // ② 编年史
+        // ② 编年史 + 稳定记忆（位于 ③ 历史之前）
         assertEquals(MemMessage.ROLE_SYSTEM, messages[1].role)
         assertTrue(messages[1].content.contains("编年史"))
         assertTrue(messages[1].content.contains("雨天"))
+        assertTrue(messages[1].content.contains("【记忆】"))
+        assertTrue(messages[1].content.contains("不要主动提前男友"))
+        assertTrue(messages[1].content.contains("面试结果还没告诉她"))
+        assertTrue(messages[1].content.contains("阶段=暧昧"))
 
         // ③ 历史原文原样保留
         assertEquals(MemMessage.ROLE_USER, messages[2].role)
@@ -76,15 +79,12 @@ class PromptAssemblerTest {
         assertEquals(MemMessage.ROLE_ASSISTANT, messages[3].role)
         assertEquals("在的，怎么啦", messages[3].content)
 
-        // ④ 临场块：记忆表 + 召回 + 尾锚
-        val ephemeral = messages[messages.size - 2]
-        assertEquals(MemMessage.ROLE_SYSTEM, ephemeral.role)
-        assertTrue(ephemeral.content.contains("【记忆】"))
-        assertTrue(ephemeral.content.contains("不要主动提前男友"))
-        assertTrue(ephemeral.content.contains("面试结果还没告诉她"))
-        assertTrue(ephemeral.content.contains("阶段=暧昧"))
-        assertTrue(ephemeral.content.contains("11-18"))
-        assertTrue(ephemeral.content.contains("尾锚"))
+        // ④ 仅当命中有效召回时注入回顾参考，不含【临场块】/【尾锚】
+        val recallLayer = messages[messages.size - 2]
+        assertEquals(MemMessage.ROLE_SYSTEM, recallLayer.role)
+        assertTrue(recallLayer.content.contains("11-18"))
+        assertFalse(recallLayer.content.contains("【临场块】"))
+        assertFalse(recallLayer.content.contains("尾锚"))
 
         // ⑤ 最新用户消息
         assertEquals(MemMessage.ROLE_USER, messages.last().role)
@@ -95,7 +95,7 @@ class PromptAssemblerTest {
     fun protocolLayerCanBeDisabled() {
         assertEquals("", PromptAssembler.buildProtocolLayer(false))
         val enabled = PromptAssembler.buildProtocolLayer(true)
-        assertTrue(enabled.contains("[[pz:emo="))
+        assertFalse(enabled.contains("[[pz:"))
         assertTrue(enabled.contains("诚实"))
         assertTrue(enabled.contains("【人设】"))
         assertTrue(enabled.contains("自由展开"))
@@ -104,6 +104,10 @@ class PromptAssemblerTest {
         assertTrue(enabled.contains("尊重边界"))
         assertFalse(enabled.contains("1–3 句"))
 
+        val tagged = PromptAssembler.buildProtocolLayer(true, includeEmotionTag = true)
+        assertTrue(tagged.contains("[[pz:emo="))
+        assertTrue(tagged.contains("|rel="))
+
         val messages = PromptAssembler.assemble(baseInput().copy(protocolEnabled = false))
         assertFalse(messages[0].content.contains("[[pz:"))
         assertTrue(messages[0].content.contains("人设"))
@@ -111,16 +115,14 @@ class PromptAssemblerTest {
     }
 
     @Test
-    fun creativeModePropagatesToProtocolAndTailAnchor() {
+    fun creativeModePropagatesToProtocolWithoutTailAnchor() {
         val messages = PromptAssembler.assemble(baseInput().copy(creativeMode = true))
         val first = messages[0].content
-        val ephemeral = messages[messages.size - 2].content
         assertTrue(first.contains("创作模式"))
         assertTrue(first.contains("不限字数"))
         assertFalse(first.contains("1–3 句"))
-        assertTrue(ephemeral.contains("尾锚"))
-        assertTrue(ephemeral.contains("不限字数"))
-        assertTrue(ephemeral.contains("始终入戏"))
+        assertTrue(messages.none { it.content.contains("尾锚") })
+        assertTrue(messages.none { it.content.contains("【临场块】") })
     }
 
     @Test
@@ -129,7 +131,7 @@ class PromptAssemblerTest {
             MemMessage.user("历史消息 $index", baseTime + index * 1_000L)
         }
         val messages = PromptAssembler.assemble(baseInput().copy(history = history))
-        // ① 之后紧跟 50 条历史原文，一条不少且顺序不变
+        // ①、② 之后紧跟 50 条历史原文，一条不少且顺序不变
         val historySlice = messages.subList(2, 2 + 50)
         assertEquals(history.map { it.content }, historySlice.map { it.content })
     }
@@ -138,7 +140,7 @@ class PromptAssemblerTest {
     fun ephemeralLayerCappedAt1500Tokens() {
         val bigMemory = MemoryTable(
             facts = (1..200).map { index ->
-                Fact(key = "key$index", value = "这是一条比较长的事实描述，用来把临场块撑到上限。$index")
+                Fact(key = "key$index", value = "这是一条比较长的事实描述，用来把记忆表撑到上限。$index")
             },
             events = (1..100).map { index -> Event(value = "事件 $index：今天发生了一些值得记住的事情") },
             loops = (1..20).map { index -> Loop(value = "未完结线索 $index：还在等结果") },
@@ -150,8 +152,8 @@ class PromptAssemblerTest {
         val messages = PromptAssembler.assemble(
             baseInput().copy(memory = bigMemory, recall = longRecall),
         )
-        val ephemeral = messages[messages.size - 2]
-        val tokens = TokenEstimator.estimateMessages(listOf(ephemeral))
+        val recallLayer = messages[messages.size - 2]
+        val tokens = TokenEstimator.estimateMessages(listOf(recallLayer))
         assertTrue("④ 段 $tokens token 超过 1500", tokens <= PromptAssembler.EPHEMERAL_LAYER_MAX_TOKENS)
     }
 
@@ -236,36 +238,44 @@ class PromptAssemblerTest {
     @Test
     fun cachePrefixAtLeast95PercentAcrossRounds() {
         val filler = "我们今天聊了很多事情，关于工作、天气、晚饭和周末的安排。"
+        val reminder = "2026-11-25,星期三,,App,中文"
         val history = (1..300).map { index ->
             val content = filler.repeat(11) + "（第 $index 条）"
             val createdAt = baseTime + index * 60_000L
             if (index % 2 == 0) {
                 MemMessage.assistant(content, createdAt)
             } else {
-                MemMessage.user(content, createdAt)
+                MemMessage.user(content, createdAt).copy(latestReminder = reminder)
             }
         }
         val chronicle = "更早之前，你们在一个雨天认识，后来一起吃过两次饭。".repeat(20)
+        // 相邻无召回两轮：③ history 后零 [system] 隔断，且前缀（① + ② + ③）完整命中
         val roundN = PromptAssembler.assemble(
             baseInput().copy(
                 chronicle = chronicle,
                 history = history,
                 userMessage = "那我们周末去西湖走走？",
-                recall = "【你们过去聊过】".repeat(20),
+                recall = null,
+                isDeepSeek = true,
+                currentLatestReminder = reminder,
             ),
         )
         val roundN1 = PromptAssembler.assemble(
             baseInput().copy(
                 chronicle = chronicle,
                 history = history + listOf(
-                    MemMessage.user("那我们周末去西湖走走？", baseTime + 301 * 60_000L),
+                    MemMessage.user("那我们周末去西湖走走？", baseTime + 301 * 60_000L).copy(latestReminder = reminder),
                     MemMessage.assistant("好啊，几点？", baseTime + 302 * 60_000L),
                 ),
                 userMessage = "早上九点可以吗？",
-                recall = "【你们过去聊过】".repeat(20),
+                recall = null,
+                isDeepSeek = true,
+                currentLatestReminder = reminder,
             ),
         )
 
+        // 无召回时 ③ 后不存在任何 [system] 隔断
+        assertEquals(2, roundN.count { it.role == MemMessage.ROLE_SYSTEM })
         val total = TokenEstimator.estimateMessages(roundN)
         val prefix = PromptAssembler.commonPrefixTokens(roundN, roundN1)
         val ratio = prefix.toDouble() / total.toDouble()
@@ -273,8 +283,8 @@ class PromptAssemblerTest {
             "公共前缀 $prefix / 总长 $total = $ratio，低于 95%",
             ratio >= 0.95,
         )
-        // 分叉点必须落在 ④（前缀应覆盖 ①②③，但不能覆盖 ④⑤）
-        assertTrue(prefix < total)
+        // 无召回连续轮去掉了末尾隔断，roundN 整体成为 roundN1 的 100% 前缀（prefix == total）
+        assertTrue(prefix <= total)
     }
 
     @Test
@@ -300,9 +310,15 @@ class PromptAssemblerTest {
 
     @Test
     fun emptyChronicleIsOmitted() {
-        val messages = PromptAssembler.assemble(baseInput().copy(chronicle = null))
-        assertFalse(messages[1].content.contains("编年史"))
-        assertEquals(MemMessage.ROLE_USER, messages[1].role)
+        val withMemoryOnly = PromptAssembler.assemble(baseInput().copy(chronicle = null))
+        assertFalse(withMemoryOnly[1].content.contains("编年史"))
+        assertTrue(withMemoryOnly[1].content.contains("【记忆】"))
+        assertEquals(MemMessage.ROLE_SYSTEM, withMemoryOnly[1].role)
+        assertEquals(MemMessage.ROLE_USER, withMemoryOnly[2].role)
+
+        val neither = PromptAssembler.assemble(baseInput().copy(chronicle = null, memory = null))
+        assertEquals(MemMessage.ROLE_USER, neither[1].role)
+        assertEquals("在吗", neither[1].content)
     }
 
     @Test
@@ -326,6 +342,7 @@ class PromptAssemblerTest {
         assertEquals("早安呀", noMemoryMessages[2].content)
         assertEquals("今天去哪玩？", noMemoryMessages[3].content)
         assertTrue(noMemoryMessages.none { it.content.contains("【临场块】") })
+        assertTrue(noMemoryMessages.none { it.content.contains("尾锚") })
 
         val blankTableMessages = PromptAssembler.assemble(
             AssembleInput(
@@ -343,43 +360,131 @@ class PromptAssemblerTest {
     }
 
     @Test
-    fun ephemeralLayerIsPresentWhenAnyMemoryRelationBoundaryOrRecallExists() {
+    fun memoryIsPlacedBeforeHistoryAndRecallAfterHistoryOnlyWhenSubstantial() {
         val withRelationOnly = PromptAssembler.assemble(
             AssembleInput(
                 personaLayer = "你是林晚。",
+                history = listOf(MemMessage.user("昨天的事", baseTime)),
                 memory = MemoryTable(relation = Relation(nicknameByMe = "小满")),
                 recall = null,
                 userMessage = "在吗",
             ),
         )
-        assertEquals(3, withRelationOnly.size)
+        // [① system, ② memory system, ③ user, ⑤ user]：稳定记忆在历史前，历史后无 system 隔断
+        assertEquals(4, withRelationOnly.size)
         assertEquals(MemMessage.ROLE_SYSTEM, withRelationOnly[1].role)
-        assertTrue(withRelationOnly[1].content.contains("【临场块】"))
         assertTrue(withRelationOnly[1].content.contains("TA 叫你「小满」"))
-        assertTrue(withRelationOnly[1].content.contains("【尾锚·保持角色】"))
+        assertEquals("昨天的事", withRelationOnly[2].content)
+        assertEquals("在吗", withRelationOnly[3].content)
+        assertTrue(withRelationOnly.none { it.content.contains("【临场块】") || it.content.contains("【尾锚") })
 
         val withBoundaryOnly = PromptAssembler.assemble(
             AssembleInput(
                 personaLayer = "你是林晚。",
+                history = listOf(MemMessage.user("昨天的事", baseTime)),
                 memory = MemoryTable(boundaries = listOf(Boundary(value = "不提前任"))),
                 userMessage = "在吗",
             ),
         )
-        assertEquals(3, withBoundaryOnly.size)
-        assertTrue(withBoundaryOnly[1].content.contains("最硬的边界：不提前任"))
+        assertEquals(4, withBoundaryOnly.size)
+        assertTrue(withBoundaryOnly[1].content.contains("不提前任"))
+        assertEquals(MemMessage.ROLE_USER, withBoundaryOnly[2].role)
 
         val withRecallOnly = PromptAssembler.assemble(
             AssembleInput(
                 personaLayer = "你是林晚。",
+                history = listOf(MemMessage.user("昨天的事", baseTime)),
                 memory = null,
                 recall = "【你们过去聊过，以下是原文摘录。】\n" + "周末约好去公园散步顺便喝咖啡聊天。".repeat(3),
                 userMessage = "走吗",
             ),
         )
-        assertEquals(3, withRecallOnly.size)
-        assertTrue(withRecallOnly[1].content.contains("【临场块】"))
-        assertTrue(withRecallOnly[1].content.contains("周末约好去公园散步"))
-        assertTrue(withRecallOnly[1].content.contains("【尾锚·保持角色】"))
+        // [① system, ③ user, ④ recall system, ⑤ user]
+        assertEquals(4, withRecallOnly.size)
+        assertEquals("昨天的事", withRecallOnly[1].content)
+        assertEquals(MemMessage.ROLE_SYSTEM, withRecallOnly[2].role)
+        assertTrue(withRecallOnly[2].content.contains("周末约好去公园散步"))
+        assertTrue(withRecallOnly.none { it.content.contains("【临场块】") || it.content.contains("【尾锚") })
+
+        // 召回不足 MIN_RECALL_TOKENS 时静默丢弃，③ 后无 [system] 隔断
+        val withTinyRecall = PromptAssembler.assemble(
+            AssembleInput(
+                personaLayer = "你是林晚。",
+                history = listOf(MemMessage.user("昨天的事", baseTime)),
+                memory = null,
+                recall = "短召回",
+                userMessage = "走吗",
+            ),
+        )
+        assertEquals(3, withTinyRecall.size)
+        assertEquals(1, withTinyRecall.count { it.role == MemMessage.ROLE_SYSTEM })
+    }
+
+    @Test
+    fun deepSeekInsertsLatestReminderOnlyBeforeUserMessages() {
+        val r1 = "2026-11-24,星期二,,App,中文"
+        val r2 = "2026-11-25,星期三,,App,中文"
+        val recall = "【你们过去聊过，以下是原文摘录。】\n" + "上次聊到周末去海边散步顺便吃海鲜。".repeat(3)
+        val messages = PromptAssembler.assemble(
+            AssembleInput(
+                personaLayer = "你是林晚。",
+                history = listOf(
+                    MemMessage.user("昨天好冷", baseTime, latestReminder = r1),
+                    MemMessage.assistant("多穿点呀", baseTime + 1_000L),
+                    MemMessage.user("这条没有历史标记", baseTime + 2_000L, latestReminder = "   "),
+                ),
+                recall = recall,
+                userMessage = "今天去哪逛？",
+                isDeepSeek = true,
+                currentLatestReminder = r2,
+            ),
+        )
+
+        assertEquals(
+            listOf(
+                MemMessage.ROLE_SYSTEM,
+                MemMessage.ROLE_LATEST_REMINDER,
+                MemMessage.ROLE_USER,
+                MemMessage.ROLE_ASSISTANT,
+                MemMessage.ROLE_USER,
+                MemMessage.ROLE_SYSTEM,
+                MemMessage.ROLE_LATEST_REMINDER,
+                MemMessage.ROLE_USER,
+            ),
+            messages.map { it.role },
+        )
+        assertEquals(r1, messages[1].content)
+        assertEquals("昨天好冷", messages[2].content)
+        // 当轮 latest_reminder 紧贴 ⑤ user 正前方，位于 ④ recall 之后
+        assertEquals(r2, messages[messages.lastIndex - 1].content)
+        assertEquals("今天去哪逛？", messages.last().content)
+    }
+
+    @Test
+    fun nonDeepSeekNeverInsertsLatestReminder() {
+        val messages = PromptAssembler.assemble(
+            AssembleInput(
+                personaLayer = "你是林晚。",
+                history = listOf(
+                    MemMessage.user("昨天好冷", baseTime, latestReminder = "2026-11-24,星期二,,App,中文"),
+                    MemMessage.assistant("多穿点呀", baseTime + 1_000L),
+                ),
+                userMessage = "今天呢？",
+                isDeepSeek = false,
+                currentLatestReminder = "2026-11-25,星期三,,App,中文",
+            ),
+        )
+
+        assertTrue(messages.none { it.role == MemMessage.ROLE_LATEST_REMINDER })
+        assertEquals(
+            listOf(
+                MemMessage.ROLE_SYSTEM,
+                MemMessage.ROLE_USER,
+                MemMessage.ROLE_ASSISTANT,
+                MemMessage.ROLE_USER,
+            ),
+            messages.map { it.role },
+        )
     }
 
     @Test

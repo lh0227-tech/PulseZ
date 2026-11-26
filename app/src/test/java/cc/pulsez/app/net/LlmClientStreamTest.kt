@@ -124,8 +124,10 @@ class LlmClientStreamTest {
                     """{"choices":[{"message":{"annotations":[""" +
                         """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"甲","start_index":0,"end_index":2}},""" +
                         """{"type":"url_citation","url_citation":{"url":"https://example.com/b","title":"乙"}},""" +
-                        // 同一地址重复出现：按 url 去重，保留第一次的标题。
-                        """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"甲（重复）"}},""" +
+                        // Keep citations for the same URL at different positions; de-duplicate only identical (url, start_index, end_index) entries.
+                        """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"甲（重复同位置）","start_index":0,"end_index":2}},""" +
+                        """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"甲（第二处）","start_index":6,"end_index":9}},""" +
+                        """{"type":"url_citation","url_citation":{"url":"https://example.com/b","title":"乙（无跨度重复）"}},""" +
                         // 缺 url、未知类型：静默跳过，不能让整轮失败。
                         """{"type":"url_citation","url_citation":{"title":"缺地址"}},""" +
                         """{"type":"other","url_citation":{"url":"https://example.com/c"}}""" +
@@ -141,8 +143,9 @@ class LlmClientStreamTest {
         val finished = events.last() as LlmEvent.Finished
         assertEquals(
             listOf(
-                Citation("https://example.com/a", "甲"),
+                Citation("https://example.com/a", "甲", startIndex = 0, endIndex = 2),
                 Citation("https://example.com/b", "乙"),
+                Citation("https://example.com/a", "甲（第二处）", startIndex = 6, endIndex = 9),
             ),
             finished.citations,
         )

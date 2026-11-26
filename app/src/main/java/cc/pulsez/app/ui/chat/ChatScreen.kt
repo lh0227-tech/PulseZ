@@ -1,7 +1,10 @@
 package cc.pulsez.app.ui.chat
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,8 +20,10 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
@@ -96,6 +101,7 @@ import cc.pulsez.app.media.CameraCapture
 import cc.pulsez.app.media.DraftImage
 import cc.pulsez.app.media.DraftRules
 import cc.pulsez.app.net.Citation
+import cc.pulsez.app.ui.copy.ChatActionCopy
 import cc.pulsez.app.ui.copy.ImageCopy
 import cc.pulsez.app.ui.copy.VoiceCopy
 import cc.pulsez.app.ui.settings.CreativeModeIntroDialog
@@ -140,9 +146,9 @@ data class ChatUiMessage(
     val role: String, // "user" | "assistant"
     val text: String,
     val failed: Boolean = false,
-    /** 思考正文：只用于折叠展示，不写进正文、不落库。*/
+    /** 思考正文：支持折叠展示，并从数据库恢复。 */
     val reasoning: String? = null,
-    /** 联网搜索来源：v0.2 只当轮展示，不落库。*/
+    /** 联网搜索来源：支持折叠展示、正文角标映射与从数据库恢复。 */
     val citations: List<Citation> = emptyList(),
     /**
      * 这条消息带的本地图片（DB 相对路径，v0.5 识图）。
@@ -155,6 +161,14 @@ data class ChatUiMessage(
     val sourceSessionId: String? = null,
     val sourceTitle: String? = null,
     val sourceStartedAt: Long? = null,
+    /** 真实数据库主键 id；流式期间保持 [id] 稳定以防列表 key 跳动。 */
+    val dbId: String? = null,
+    /** 联网工具实时进度文案（正文开始或结束后清空）。 */
+    val toolProgressText: String? = null,
+    /** 普通文件附件的原始文件名列表。 */
+    val fileNames: List<String> = emptyList(),
+    /** 失败占位关联的已落库用户消息 id，供原地重试复用。 */
+    val targetUserDbId: String? = null,
 )
 
 @Composable
@@ -257,6 +271,16 @@ fun ChatScreen(
     onSkipAwakening: () -> Unit = { voice.awakeningBridge?.onSkip?.invoke() },
     onStartReunion: () -> Unit = { voice.awakeningBridge?.onStartReunion?.invoke() },
     onCompleteReunion: () -> Unit = { voice.awakeningBridge?.onCompleteReunion?.invoke() },
+    // ------------------------------------------------ v0.6.10 消息操作 + 文件上传
+    fileInputEnabled: Boolean = false,
+    fileDrafts: List<DraftFile> = emptyList(),
+    uploadingFiles: Boolean = false,
+    onFilePicked: (Uri) -> Unit = {},
+    onRemoveFileDraft: (String) -> Unit = {},
+    onRegenerateMessage: (String) -> Unit = {},
+    onRetryMessage: (String) -> Unit = {},
+    onDeleteMessage: (String) -> Unit = {},
+    onShowNotice: (String) -> Unit = {},
 ) {
     // rememberLazyListState uses rememberSaveable and would restore an old scroll position after
     // recreation. A fresh state makes every open/rebuild start from the newest message.
@@ -617,6 +641,14 @@ fun ChatScreen(
         }
     }
 
+    // An OpenDocument result may arrive after this chat composition has been disposed. Keep the late callback
+    // from importing a file into the old ViewModel/session. The VM also checks its own page/wipe generation.
+    val filePickerCallbackActive = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    DisposableEffect(filePickerCallbackActive) {
+        filePickerCallbackActive.set(true)
+        onDispose { filePickerCallbackActive.set(false) }
+    }
+
     // ---- v0.5.0 识图：选图/拍照的 ActivityResult 接线 ----
     // 相册走 Photo Picker（官方 API，免存储权限；设备没有 picker 时 activity 库自动回退
     // ACTION_OPEN_DOCUMENT）。依据：https://developer.android.com/training/data-storage/shared/photopicker
@@ -625,6 +657,11 @@ fun ChatScreen(
     ) { uri: Uri? ->
         // 取消（null）什么都不做：不弹错误、不指责用户（postel 原则 失败态）。
         if (uri != null) onImagePicked(uri)
+    }
+    val documentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri != null && filePickerCallbackActive.get()) onFilePicked(uri)
     }
     // 拍照走 TakePicture + FileProvider：**不声明 CAMERA** 就不需要相机权限；
     // manifest 里只暴露 cacheDir/camera/（res/xml/file_paths.xml）。
@@ -642,6 +679,29 @@ fun ChatScreen(
 
     // 点开的大图（本地路径）。返回手势由 Dialog 自己处理：先关预览，不退聊天页。
     var previewPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var actionSheetMessageId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingDeleteMessageId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val openUrl: (String) -> Unit = { rawUrl ->
+        val clean = rawUrl.trim()
+        if (!ChatMarkdown.isValidHttpUrl(clean)) {
+            onShowNotice(ChatActionCopy.OPEN_LINK_UNSUPPORTED)
+        } else {
+            val launched = runCatching {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(clean)))
+            }.isSuccess
+            if (!launched) {
+                onShowNotice(ChatActionCopy.OPEN_LINK_FAILED)
+            }
+        }
+    }
+    val copyMessageText: (String) -> Unit = { text ->
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText(ChatActionCopy.CLIP_LABEL, text))
+            onShowNotice(ChatActionCopy.COPIED)
+        }
+    }
 
     // 输入条右下角主按钮的状态机（v0.5.1 起含语音/键盘两态）：
     // 空输入 = 语音入口（普通模式）/ 键盘（语音模式）；有字 = 发送↑；生成中 = 停下■。
@@ -656,12 +716,16 @@ fun ChatScreen(
         // 门禁隐藏时不留麦克风死按钮：空输入退回禁用发送箭头（非 DeepSeek / 没密钥 / 没麦克风）。
         voiceEntryVisible = voice.visible,
         frozen = isAwakening,
+        fileDrafts = fileDrafts,
+        uploadingFiles = uploadingFiles,
     )
 
-    // v0.5.2：第二行独立麦克风入口——有文字（或已就绪草稿图）时也能继续口述。
+    // v0.5.2：第二行独立麦克风入口——有文字（或已就绪草稿图/文件）时也能继续口述。
     // `hasComposableContent` 用 `isNotBlank()`：纯空白输入不算内容，否则空输入会冒出第二个麦克风
     //（主按钮已经是麦克风）。纯函数在 `VoiceModeState.kt`，逐条真值表有单测。
-    val hasComposableContent = input.isNotBlank() || DraftRules.hasReady(drafts)
+    val hasComposableContent = input.isNotBlank() ||
+        DraftRules.hasReady(drafts) ||
+        FileDraftRules.hasReady(fileDrafts)
     val showVoiceMic = shouldShowVoiceMic(
         voiceEntryVisible = voice.visible,
         mode = voice.mode,
@@ -849,6 +913,7 @@ fun ChatScreen(
         lastMessage?.text?.length,
         lastMessage?.reasoning?.length,
         lastMessage?.citations?.size,
+        lastMessage?.toolProgressText,
         messages.size,
         hasMoreOlder,
         isStreaming,
@@ -865,6 +930,7 @@ fun ChatScreen(
             lastReasoningLength = lastMessage?.reasoning?.length ?: 0,
             lastCitationsCount = lastMessage?.citations?.size ?: 0,
             isStreaming = isStreaming,
+            lastToolProgress = lastMessage?.toolProgressText,
         )
         val hasAcceptedSend = acceptedSendToken > consumedSendToken
         if (hasAcceptedSend) {
@@ -1032,11 +1098,22 @@ fun ChatScreen(
                     if (shouldShowImportSourceHeader(messages, index)) {
                         ImportSourceHeader(message.sourceTitle, message.sourceStartedAt)
                     }
+                    val openActionSheet: (() -> Unit)? = if (
+                        ChatMessageActions.canCopy(message) ||
+                        ChatMessageActions.canRegenerate(messages, message, isStreaming, isAwakening) ||
+                        ChatMessageActions.canDelete(isStreaming, isAwakening)
+                    ) {
+                        { actionSheetMessageId = message.id }
+                    } else {
+                        null
+                    }
                     if (message.role == "user") {
                         UserMessageBubble(
                             text = message.text,
                             imagePaths = message.imagePaths,
                             onOpenImage = { previewPath = it },
+                            fileNames = message.fileNames,
+                            onLongClick = openActionSheet,
                         )
                     } else {
                         val newestMessageId = messages.lastOrNull()?.id
@@ -1052,6 +1129,11 @@ fun ChatScreen(
                                 streaming = isStreaming,
                                 isNewestMessage = message.id == newestMessageId,
                             ),
+                            isStreaming = isStreaming,
+                            isAwakening = isAwakening,
+                            onRetry = { onRetryMessage(message.id) },
+                            onOpenUrl = openUrl,
+                            onLongClick = openActionSheet,
                         )
                     }
                 }
@@ -1156,19 +1238,35 @@ fun ChatScreen(
             ReadingHintBar(onStop = onStopReading)
         }
 
-        // 草稿行（v0.5 识图）：只在有附件时出现；准备中/失败态在这里可见。
+        // 上传中轻提示（v0.6.10 文件上传期让用户明确看到状态）。
+        if (uploadingFiles) {
+            Text(
+                text = ChatActionCopy.UPLOADING_FILES,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            )
+        }
+
+        // 草稿行（v0.5 识图 + v0.6.10 文件）：只在有附件时出现；准备中/失败态在这里可见。
         ImageDraftRow(drafts = drafts, onRemove = onRemoveDraft)
+        FileDraftRow(
+            drafts = fileDrafts,
+            onRemove = onRemoveFileDraft,
+            enabled = !uploadingFiles,
+        )
 
         // 输入区（官方同款两行输入条）：第一行文本；第二行左胶囊、右下 [＋][主按钮]。
-        // 「＋」位于输入条右下角，与主按钮并排；不放在输入条左侧。
-        // 非 DeepSeek 端点不显示图片入口（不出现假入口）；模型看不了图时置灰但仍可点，点了给说明。
+        // 非 DeepSeek 端点隐藏附件入口；非识图 DeepSeek 端点仍可点「＋」发文件。
+        val attachmentEntryVisible = imageInputVisible || fileInputEnabled
+        val attachmentEntryEnabled = imageInputEnabled || fileInputEnabled
         ChatComposer(
             value = input,
             onValueChange = { newValue ->
                 if (newValue != input) keyboardHideGate.invalidate()
                 onInputChange(newValue)
             },
-            enabled = !isAwakening,
+            enabled = !isAwakening && !uploadingFiles,
             placeholder = if (isAwakening) AWAKENING_FROZEN_PLACEHOLDER else VoiceCopy.PLACEHOLDER,
             onUserInteraction = keyboardHideGate::invalidate,
             onSend = requestSend,
@@ -1178,9 +1276,14 @@ fun ChatScreen(
             },
             primary = primary,
             chips = composerChips,
-            showAddImage = imageInputVisible,
-            addImageEnabled = imageInputEnabled,
-            addImageContentDescription = if (imageInputEnabled) ImageCopy.ADD else ImageCopy.ADD_DISABLED,
+            showAddImage = attachmentEntryVisible,
+            addImageEnabled = attachmentEntryEnabled,
+            addImageContentDescription = when {
+                imageInputEnabled && fileInputEnabled -> ChatActionCopy.ADD_ATTACHMENT
+                fileInputEnabled -> ChatActionCopy.ADD_FILE
+                imageInputEnabled -> ImageCopy.ADD
+                else -> ImageCopy.ADD_DISABLED
+            },
             onAddImage = onAddImage,
             // ---- v0.5.1 语音：模式切换 / 按住说话 / 失败出路 / 转写插入 ----
             // 切到语音模式时先收键盘（官方语音模式不弹输入法）；回来时由转写插入重新聚焦。
@@ -1221,11 +1324,15 @@ fun ChatScreen(
         }
     }
 
-    // 「拍照 / 从相册选」底部面板（ModalBottomSheet：返回=收弹层，insets 由 处理）。
+    // 「拍照 / 从相册选 / 发文件」底部面板（M3 ModalBottomSheet：返回=收弹层，insets 由 M3 处理）。
     if (showImageSource) {
         ImageSourceSheet(
             onCamera = {
                 onDismissImageSource()
+                if (!imageInputEnabled) {
+                    onShowNotice(ImageCopy.VISION_MODEL_DISABLED)
+                    return@ImageSourceSheet
+                }
                 // 先建私有目录里的输出文件，再把 content:// Uri 交给系统相机写。
                 val file = runCatching { CameraCapture.newOutputFile(context) }.getOrNull()
                 if (file != null) {
@@ -1248,6 +1355,10 @@ fun ChatScreen(
             },
             onGallery = {
                 onDismissImageSource()
+                if (!imageInputEnabled) {
+                    onShowNotice(ImageCopy.VISION_MODEL_DISABLED)
+                    return@ImageSourceSheet
+                }
                 // ImageOnly：只选图片（官方 Photo Picker 支持该过滤）。
                 runCatching {
                     galleryLauncher.launch(
@@ -1255,12 +1366,83 @@ fun ChatScreen(
                     )
                 }
             },
+            onFile = if (fileInputEnabled) {
+                {
+                    onDismissImageSource()
+                    runCatching { documentLauncher.launch(arrayOf("*/*")) }
+                }
+            } else {
+                null
+            },
+            imageEnabled = imageInputEnabled,
+            fileEnabled = fileInputEnabled,
+            imageDisabledHint = if (!imageInputEnabled) ChatActionCopy.VISION_DISABLED_IN_SHEET else null,
             onDismiss = onDismissImageSource,
         )
     }
 
-    // 首次带图发送说明（三段逐字 + 隐私补充第 4 行；只弹一次，两个按钮都不阻断发送）。
-    // 第 4 行补充图片隐私提醒，提示用户遮挡他人信息并避免发送敏感证件。
+    actionSheetMessageId?.let { targetId ->
+        val target = messages.firstOrNull { it.id == targetId }
+        if (target == null) {
+            actionSheetMessageId = null
+        } else {
+            val copyText = ChatMessageActions.copyableText(target)
+            val canRegenerate = ChatMessageActions.canRegenerate(messages, target, isStreaming, isAwakening)
+            val canDelete = ChatMessageActions.canDelete(isStreaming, isAwakening)
+            if (copyText != null || canRegenerate || canDelete) {
+                ChatActionSheet(
+                    canCopy = copyText != null,
+                    canRegenerate = canRegenerate,
+                    canDelete = canDelete,
+                    onCopy = {
+                        actionSheetMessageId = null
+                        copyText?.let(copyMessageText)
+                    },
+                    onRegenerate = {
+                        actionSheetMessageId = null
+                        onRegenerateMessage(target.id)
+                    },
+                    onDelete = {
+                        actionSheetMessageId = null
+                        pendingDeleteMessageId = target.id
+                    },
+                    onDismiss = { actionSheetMessageId = null },
+                )
+            } else {
+                actionSheetMessageId = null
+            }
+        }
+    }
+
+    pendingDeleteMessageId?.let { targetId ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteMessageId = null },
+            title = { Text(ChatActionCopy.DELETE_TITLE) },
+            text = { Text(ChatActionCopy.DELETE_BODY) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDeleteMessageId = null
+                        onDeleteMessage(targetId)
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text(ChatActionCopy.DELETE_CONFIRM, color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingDeleteMessageId = null },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text(ChatActionCopy.DELETE_CANCEL)
+                }
+            },
+        )
+    }
+
+    // 首次带图发送时显示说明，只弹一次；两个按钮都不阻断发送。
+    // 第 4 行提醒用户遮挡他人信息并避免发送敏感证件。
     // 渲染直接遍历 `ImageCopy.INTRO_LINES`，行数随该列表（现在是 4 行），不在这里写死。
     if (showImageIntro) {
         AlertDialog(
@@ -1819,11 +2001,17 @@ private fun DeepSeekTogglePill(
  * @param thinkingInProgress 只有最后一条正在生成的消息为真（显示「正在深度思考……」）。
  * @param announceBody 是否给正文挂 liveRegion（判定见 [ChatAnnounce.shouldAnnounce]）。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AssistantMessage(
     message: ChatUiMessage,
     thinkingInProgress: Boolean,
     announceBody: Boolean,
+    isStreaming: Boolean = false,
+    isAwakening: Boolean = false,
+    onRetry: () -> Unit = {},
+    onOpenUrl: (String) -> Unit = {},
+    onLongClick: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier
@@ -1841,10 +2029,28 @@ private fun AssistantMessage(
             Spacer(Modifier.height(6.dp))
         }
 
+        val toolProgress = message.toolProgressText
+        if (!message.failed && !toolProgress.isNullOrBlank()) {
+            Text(
+                text = toolProgress,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+        }
+
+        val citationColor = MaterialTheme.colorScheme.primary
         val renderedText = if (message.failed) {
             AnnotatedString(message.text)
         } else {
-            remember(message.text) { ChatMarkdown.render(message.text) }
+            remember(message.text, message.citations, citationColor) {
+                ChatMarkdown.render(
+                    text = message.text,
+                    citations = message.citations,
+                    citationColor = citationColor,
+                    onCitationClick = { citation -> onOpenUrl(citation.url) },
+                )
+            }
         }
         Text(
             text = renderedText,
@@ -1854,17 +2060,47 @@ private fun AssistantMessage(
             } else {
                 MaterialTheme.colorScheme.onBackground
             },
-            modifier = if (announceBody) {
-                Modifier.semantics { liveRegion = LiveRegionMode.Polite }
-            } else {
-                Modifier
-            },
+            modifier = Modifier
+                .then(
+                    if (onLongClick != null) {
+                        Modifier.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                    } else {
+                        Modifier
+                    },
+                )
+                .then(
+                    if (announceBody) {
+                        Modifier.semantics { liveRegion = LiveRegionMode.Polite }
+                    } else {
+                        Modifier
+                    },
+                ),
         )
 
-        // 引用层：气泡下方一行「参考了 N 个来源」，点击展开标题 + 地址。
-        if (message.citations.isNotEmpty()) {
+        if (message.failed && !isStreaming && !isAwakening) {
             Spacer(Modifier.height(4.dp))
-            CitationsBlock(id = message.id, citations = message.citations)
+            TextButton(
+                onClick = onRetry,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text(
+                    text = ChatActionCopy.RETRY,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+        }
+
+        // 引用层：气泡下方一行「参考了 N 个来源」，点击展开按 URL 去重并编号的可点来源列表。
+        val numberedCitations = remember(message.citations) {
+            ChatMarkdown.numberCitations(message.citations)
+        }
+        if (numberedCitations.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            CitationsBlock(
+                id = message.id,
+                citations = numberedCitations,
+                onOpenUrl = onOpenUrl,
+            )
         }
     }
 }
@@ -1916,7 +2152,11 @@ private fun ReasoningBlock(id: String, reasoning: String, inProgress: Boolean) {
 }
 
 @Composable
-private fun CitationsBlock(id: String, citations: List<Citation>) {
+private fun CitationsBlock(
+    id: String,
+    citations: List<NumberedCitation>,
+    onOpenUrl: (String) -> Unit,
+) {
     var expanded by rememberSaveable(id) { mutableStateOf(false) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Column {
@@ -1945,21 +2185,27 @@ private fun CitationsBlock(id: String, citations: List<Citation>) {
         if (expanded) {
             Column(
                 modifier = Modifier.padding(bottom = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 citations.forEach { citation ->
-                    Column {
-                        citation.title?.let { title ->
-                            Text(
-                                text = title,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                        }
+                    val label = if (citation.title != null) {
+                        "[${citation.index}] ${citation.title} - ${citation.url}"
+                    } else {
+                        "[${citation.index}] ${citation.url}"
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(role = Role.Button, onClick = { onOpenUrl(citation.url) })
+                            .padding(horizontal = 4.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         Text(
-                            text = citation.url,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = muted,
+                            text = label,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
                         )
                     }
                 }
@@ -1987,6 +2233,7 @@ internal data class ChatScrollSnapshot(
     val lastReasoningLength: Int = 0,
     val lastCitationsCount: Int = 0,
     val isStreaming: Boolean = false,
+    val lastToolProgress: String? = null,
 )
 
 internal object ChatAutoScroll {
@@ -2255,7 +2502,8 @@ internal object ChatAutoScroll {
         }
         val lastContentGrew = current.lastMessageTextLength > previous.lastMessageTextLength ||
             current.lastReasoningLength > previous.lastReasoningLength ||
-            current.lastCitationsCount > previous.lastCitationsCount
+            current.lastCitationsCount > previous.lastCitationsCount ||
+            (!current.lastToolProgress.isNullOrBlank() && current.lastToolProgress != previous.lastToolProgress)
         if (lastContentGrew) {
             return atBottomForFollow(
                 firstVisibleItemIndex,
@@ -2395,4 +2643,35 @@ internal object ChatAnnounce {
      */
     fun shouldAnnounce(streaming: Boolean, isNewestMessage: Boolean): Boolean =
         isNewestMessage && !streaming
+}
+
+/**
+ * 1:1 聊天消息长按菜单可见性与可复制内容判定（纯 Kotlin，JVM 单测可直接覆盖）。
+ */
+internal object ChatMessageActions {
+
+    fun copyableText(message: ChatUiMessage): String? {
+        if (message.failed) return null
+        val trimmed = message.text.trim()
+        if (trimmed.isEmpty()) return null
+        if (message.imagePaths.isNotEmpty() && trimmed == ImageCopy.IMAGE_PLACEHOLDER) return null
+        if (message.fileNames.isNotEmpty() && trimmed == ChatActionCopy.FILE_PLACEHOLDER) return null
+        return message.text
+    }
+
+    fun canCopy(message: ChatUiMessage): Boolean = copyableText(message) != null
+
+    fun canRegenerate(
+        messages: List<ChatUiMessage>,
+        target: ChatUiMessage,
+        isStreaming: Boolean,
+        isAwakening: Boolean,
+    ): Boolean {
+        if (isStreaming || isAwakening) return false
+        if (target.role != "assistant") return false
+        return messages.lastOrNull()?.id == target.id
+    }
+
+    fun canDelete(isStreaming: Boolean, isAwakening: Boolean): Boolean =
+        !isStreaming && !isAwakening
 }
